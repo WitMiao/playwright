@@ -115,6 +115,7 @@ const ConnectApp: React.FC = () => {
       }
       if (token) {
         setError('Invalid token provided.');
+        await chrome.runtime.sendMessage({ type: 'rejectConnection' }).catch(() => {});
         return;
       }
 
