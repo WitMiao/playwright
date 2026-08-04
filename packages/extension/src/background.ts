@@ -35,6 +35,8 @@ type PageMessage = {
 } | {
   type: 'getConnectionStatus';
 } | {
+  type: 'rejectConnection';
+} | {
   type: 'disconnect';
   connectionId?: string;
 } | {
@@ -94,6 +96,11 @@ class PlaywrightExtension {
           })),
         });
         return false;
+      case 'rejectConnection':
+        this._pendingConnections.reject(sender.tab!.id!, 'Playwright Extension rejected the authentication token.').then(
+            () => sendResponse({ success: true }),
+            (error: any) => sendResponse({ success: false, error: error.message }));
+        return true;
       case 'disconnect':
         try {
           this._disconnect(message.connectionId, 'User disconnected');
