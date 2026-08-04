@@ -14,13 +14,16 @@
  * limitations under the License.
  */
 
-import { debugLog } from './relayConnection';
+import { RelayConnection, debugLog } from './relayConnection';
 import { PendingConnections } from './pendingConnection';
-import { ConnectedTabGroup, cleanupStalePlaywrightGroups, isNonDebuggableUrl } from './connectedTabGroup';
+import { ConnectedTabGroup, isNonDebuggableUrl } from './connectedTabGroup';
+import { cleanupStalePlaywrightGroups } from './taskResources';
 
 type PageMessage = {
   type: 'connectionRequested';
   mcpRelayUrl: string;
+  connectionId?: string;
+  taskId?: string;
 } | {
   type: 'getTabs';
 } | {
@@ -32,14 +35,24 @@ type PageMessage = {
 } | {
   type: 'getConnectionStatus';
 } | {
+  type: 'rejectConnection';
+} | {
   type: 'disconnect';
+  connectionId?: string;
 } | {
   type: 'keepalive';
 };
 
 class PlaywrightExtension {
-  private _activeGroup: ConnectedTabGroup | undefined;
-  private _activeClientName: string | undefined;
+  private _activeConnections = new Map<string, {
+    group: ConnectedTabGroup;
+    clientName?: string;
+    taskId: string;
+  }>();
+  // A connect dialog can submit a tab snapshot that another dialog also saw.
+  // Reserve explicit selections before opening their relay connection, then
+  // transfer ownership to the active ConnectedTabGroup without an await gap.
+  private _reservedTabIds = new Set<number>();
   private _pendingConnections = new PendingConnections();
   // Service worker restarts lose all connection state, so any existing
   // Playwright groups are stale. Connections wait on this before reconciling.
@@ -55,7 +68,11 @@ class PlaywrightExtension {
   private _onMessage(message: PageMessage, sender: chrome.runtime.MessageSender, sendResponse: (response: any) => void) {
     switch (message.type) {
       case 'connectionRequested':
-        this._pendingConnections.create(sender.tab!.id!, message.mcpRelayUrl);
+        this._pendingConnections.create(sender.tab!.id!, {
+          mcpRelayUrl: message.mcpRelayUrl,
+          connectionId: message.connectionId || crypto.randomUUID(),
+          taskId: message.taskId || 'Playwright',
+        });
         sendResponse({ success: true });
         return false;
       case 'getTabs':
@@ -64,25 +81,29 @@ class PlaywrightExtension {
             (error: any) => sendResponse({ success: false, error: error.message }));
         return true;
       case 'connectToTab': {
-        // Token-bypass (no specific pick) falls back to the connect page itself
-        // so `ConnectedTabGroup` always has a concrete tab to start from. Both
-        // sender.tab and UI-supplied tabs come from chrome.tabs.query / runtime
-        // message sender, where `id` is always defined.
-        const selectedTab = (message.tab ?? sender.tab!) as chrome.tabs.Tab & { id: number };
-        this._connectTab(sender.tab!.id!, selectedTab, message.clientName).then(
+        this._connectTab(sender.tab!.id!, sender.tab!.windowId, message.tab, message.clientName).then(
             () => sendResponse({ success: true }),
             (error: any) => sendResponse({ success: false, error: error.message }));
         return true; // Return true to indicate that the response will be sent asynchronously
       }
       case 'getConnectionStatus':
         sendResponse({
-          connectedTabIds: this._activeGroup?.connectedTabIds() ?? [],
-          clientName: this._activeClientName,
+          connections: [...this._activeConnections].map(([connectionId, connection]) => ({
+            connectionId,
+            clientName: connection.clientName,
+            taskId: connection.taskId,
+            connectedTabIds: connection.group.connectedTabIds(),
+          })),
         });
         return false;
+      case 'rejectConnection':
+        this._pendingConnections.reject(sender.tab!.id!, 'Playwright Extension rejected the authentication token.').then(
+            () => sendResponse({ success: true }),
+            (error: any) => sendResponse({ success: false, error: error.message }));
+        return true;
       case 'disconnect':
         try {
-          this._disconnect('User disconnected');
+          this._disconnect(message.connectionId, 'User disconnected');
           sendResponse({ success: true });
         } catch (error: any) {
           sendResponse({ success: false, error: error.message });
@@ -95,41 +116,99 @@ class PlaywrightExtension {
     }
   }
 
-  private async _connectTab(selectorTabId: number, tab: chrome.tabs.Tab & { id: number }, clientName: string | undefined): Promise<void> {
+  private async _connectTab(selectorTabId: number, selectorWindowId: number, tab: chrome.tabs.Tab | undefined, clientName: string | undefined): Promise<void> {
+    let reservedTabId: number | undefined;
+    let acceptedConnection: RelayConnection | undefined;
     try {
       await this._cleanupPromise;
-      this._disconnect('Another connection is requested');
 
-      const connection = await this._pendingConnections.take(selectorTabId);
-      if (!connection)
-        throw new Error('Pending client connection closed');
-
-      const group = new ConnectedTabGroup(connection, tab);
-      group.onclose = () => {
-        if (this._activeGroup === group) {
-          this._activeGroup = undefined;
-          this._activeClientName = undefined;
+      let selectedTab = tab;
+      if (tab?.id !== undefined) {
+        const conflictMessage = 'Tab is already connected to another Playwright client.';
+        if (this._claimedTabIds().has(tab.id)) {
+          await this._pendingConnections.reject(selectorTabId, conflictMessage).catch(error => {
+            debugLog('Failed to reject duplicate tab connection:', error);
+          });
+          throw new Error(conflictMessage);
         }
+        reservedTabId = tab.id;
+        this._reservedTabIds.add(tab.id);
+        selectedTab = await chrome.tabs.get(tab.id);
+      }
+
+      const pending = await this._pendingConnections.take(selectorTabId);
+      if (!pending)
+        throw new Error('Pending client connection closed');
+      acceptedConnection = pending.connection;
+      if (this._activeConnections.has(pending.connectionId))
+        throw new Error('Connection id is already active');
+      selectedTab ??= await chrome.tabs.create({
+        url: 'about:blank',
+        active: false,
+        index: 0,
+        windowId: selectorWindowId,
+      });
+      if (selectedTab.id === undefined)
+        throw new Error('Failed to create a background task tab');
+
+      const group = new ConnectedTabGroup(
+          pending.connection,
+          selectedTab,
+          pending.connectionId,
+          pending.taskId,
+          !tab,
+          tabId => this._isTabClaimedByOtherTask(tabId, group));
+      group.onclose = () => {
+        if (this._activeConnections.get(pending.connectionId)?.group === group)
+          this._activeConnections.delete(pending.connectionId);
       };
-      this._activeGroup = group;
-      this._activeClientName = clientName;
+      this._activeConnections.set(pending.connectionId, { group, clientName, taskId: pending.taskId });
+      acceptedConnection = undefined;
+      if (reservedTabId !== undefined) {
+        this._reservedTabIds.delete(reservedTabId);
+        reservedTabId = undefined;
+      }
 
-      await Promise.all([
-        chrome.tabs.update(tab.id, { active: true }),
-        chrome.windows.update(tab.windowId, { focused: true }),
-      ]).catch(() => {});
-
-      if (tab.id !== selectorTabId)
-        await chrome.tabs.remove(selectorTabId).catch(() => {});
+      // Activating a target is reserved for the user's explicit
+      // "Allow & select" click. Background/token authorization never enters
+      // this branch and never changes the active tab.
+      if (tab) {
+        await Promise.all([
+          chrome.tabs.update(selectedTab.id, { active: true }),
+          chrome.windows.update(selectedTab.windowId, { focused: true }),
+        ]).catch(() => {});
+      }
+      await chrome.tabs.remove(selectorTabId).catch(() => {});
     } catch (error: any) {
-      debugLog(`Failed to connect tab ${tab.id}:`, error.message);
+      acceptedConnection?.close(error.message);
+      if (reservedTabId !== undefined)
+        this._reservedTabIds.delete(reservedTabId);
+      await this._pendingConnections.reject(selectorTabId, error.message).catch(rejectionError => {
+        debugLog('Failed to reject pending connection:', rejectionError);
+      });
+      debugLog(`Failed to connect task tab:`, error.message);
       throw error;
     }
   }
 
   private async _getTabs(): Promise<chrome.tabs.Tab[]> {
     const tabs = await chrome.tabs.query({});
-    return tabs.filter(tab => !isNonDebuggableUrl(tab.url));
+    const claimedTabIds = this._claimedTabIds();
+    return tabs.filter(tab => !isNonDebuggableUrl(tab.url) && (tab.id === undefined || !claimedTabIds.has(tab.id)));
+  }
+
+  private _claimedTabIds(): Set<number> {
+    return new Set([
+      ...this._reservedTabIds,
+      ...[...this._activeConnections.values()].flatMap(connection => connection.group.claimedTabIds()),
+    ]);
+  }
+
+  private _isTabClaimedByOtherTask(tabId: number, currentGroup: ConnectedTabGroup): boolean {
+    if (this._reservedTabIds.has(tabId))
+      return true;
+    return [...this._activeConnections.values()].some(connection =>
+      connection.group !== currentGroup && connection.group.claimedTabIds().includes(tabId));
   }
 
   private async _onActionClicked(): Promise<void> {
@@ -139,12 +218,16 @@ class PlaywrightExtension {
     });
   }
 
-  // Closes the active group's connection if any. ConnectedTabGroup's onclose
-  // handles state cleanup (connectedTabIds, badges, reconcile).
-  private _disconnect(reason: string) {
-    this._activeGroup?.close(reason);
-    this._activeGroup = undefined;
-    this._activeClientName = undefined;
+  // Closes one connection, or every connection for backwards-compatible
+  // callers that omit a connection id. Each ConnectedTabGroup owns its own
+  // resource cleanup.
+  private _disconnect(connectionId: string | undefined, reason: string) {
+    if (connectionId) {
+      this._activeConnections.get(connectionId)?.group.close(reason);
+      return;
+    }
+    for (const connection of this._activeConnections.values())
+      connection.group.close(reason);
   }
 }
 
