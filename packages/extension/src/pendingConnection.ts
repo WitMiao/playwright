@@ -16,25 +16,64 @@
 
 import { RelayConnection, debugLog } from './relayConnection';
 
+const kConnectionRejectedCloseCode = 4001;
+
+export type PendingConnection = {
+  connection: RelayConnection;
+  connectionId: string;
+  taskId: string;
+};
+
+type PendingConnectionRequest = Omit<PendingConnection, 'connection'> & {
+  mcpRelayUrl: string;
+};
+
 // Relay URLs recorded by `connectionRequested`, keyed by the connect page tab
 // id. The relay WebSocket opens lazily in `take` once the user clicks Allow.
 export class PendingConnections {
-  private _map = new Map<number, string>();
+  private _map = new Map<number, PendingConnectionRequest>();
 
   constructor() {
     chrome.tabs.onRemoved.addListener(tabId => this._map.delete(tabId));
   }
 
-  create(selectorTabId: number, mcpRelayUrl: string): void {
-    this._map.set(selectorTabId, mcpRelayUrl);
+  create(selectorTabId: number, request: PendingConnectionRequest): void {
+    this._map.set(selectorTabId, request);
   }
 
-  async take(selectorTabId: number): Promise<RelayConnection | undefined> {
-    const mcpRelayUrl = this._map.get(selectorTabId);
-    if (mcpRelayUrl === undefined)
+  async reject(selectorTabId: number, reason: string): Promise<void> {
+    const request = this._map.get(selectorTabId);
+    if (!request)
+      return;
+    this._map.delete(selectorTabId);
+    await rejectRelayConnection(request.mcpRelayUrl, reason);
+  }
+
+  async take(selectorTabId: number): Promise<PendingConnection | undefined> {
+    const request = this._map.get(selectorTabId);
+    if (!request)
       return undefined;
     this._map.delete(selectorTabId);
-    return openRelayConnection(mcpRelayUrl);
+    return {
+      connection: await openRelayConnection(request.mcpRelayUrl),
+      connectionId: request.connectionId,
+      taskId: request.taskId,
+    };
+  }
+}
+
+async function rejectRelayConnection(mcpRelayUrl: string, reason: string): Promise<void> {
+  const socket = new WebSocket(mcpRelayUrl);
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      timeout = setTimeout(() => reject(new Error('Connection timeout')), 5000);
+      socket.onopen = () => socket.close(kConnectionRejectedCloseCode, reason);
+      socket.onerror = () => reject(new Error('WebSocket error'));
+      socket.onclose = () => resolve();
+    });
+  } finally {
+    clearTimeout(timeout);
   }
 }
 

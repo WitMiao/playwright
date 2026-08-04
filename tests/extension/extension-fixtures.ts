@@ -43,7 +43,7 @@ export type TestFixtures = {
   cli: (args: string[], options?: { env?: Record<string, string> }) => Promise<CliResult>;
 };
 
-export const extensionId = 'mmlmfjhmonkocbjadbfplnigmagldckm';
+export const extensionId = 'mmblklcefccekjbfjehkpmeibpjlanca';
 
 export const test = base.extend<TestFixtures>({
   pathToExtension: async ({}, use, testInfo) => {
@@ -77,7 +77,6 @@ export const test = base.extend<TestFixtures>({
             `--load-extension=${pathToExtension}`,
           ],
         });
-
         // MV3 service workers start lazily; wait for the extension's
         // background to be ready so tests can reach `chrome.*` via it.
         if (!browserContext.serviceWorkers().length)
@@ -210,7 +209,11 @@ export async function readExtensionToken(browserContext: BrowserContext): Promis
 // with the click — the request reaches the background while the page is being
 // torn down. Swallow the resulting "Target closed" error.
 export async function clickAllowAndSelect(connectPage: Page, tabTitle: RegExp | string): Promise<void> {
-  await connectPage.locator('.tab-item', { hasText: tabTitle }).getByRole('button', { name: 'Allow & select' }).click().catch(e => {
+  await connectPage.locator('.tab-item').first().waitFor();
+  const matchingTab = connectPage.locator('.tab-item', { hasText: tabTitle });
+  await expect(matchingTab, `Expected one selectable tab matching ${String(tabTitle)}`).toHaveCount(1);
+  const button = matchingTab.getByRole('button', { name: 'Allow & select' });
+  await button.click().catch(e => {
     if (!e?.message?.includes(kTargetClosedErrorMessage))
       throw e;
   });

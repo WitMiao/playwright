@@ -61,6 +61,8 @@ export class CDPRelayServer {
   private _httpServer: http.Server;
   private _wsHost: string;
   private _browserChannel: string;
+  private _taskId: string;
+  private _connectionId: string;
   private _executablePath?: string;
   private _userDataDir?: string;
   private _cdpPath: string;
@@ -72,10 +74,11 @@ export class CDPRelayServer {
   private _handler: ExtensionProtocolV2;
   private _extensionConnectionPromise = new ManualPromise<void>();
 
-  constructor(server: http.Server, browserChannel: string, executablePath?: string, userDataDir?: string) {
+  constructor(server: http.Server, browserChannel: string, executablePath?: string, userDataDir?: string, taskId = 'Playwright MCP') {
     this._httpServer = server;
     this._wsHost = addressToString(server.address(), { protocol: 'ws' });
     this._browserChannel = browserChannel;
+    this._taskId = taskId;
     this._executablePath = executablePath;
     this._userDataDir = userDataDir;
     this._protocolVersion = parseInt(process.env.PLAYWRIGHT_EXTENSION_PROTOCOL ?? protocol.VERSION.toString(), 10);
@@ -87,9 +90,9 @@ export class CDPRelayServer {
     };
     this._handler = new ExtensionProtocolV2(sendCommand);
 
-    const uuid = crypto.randomUUID();
-    this._cdpPath = `/cdp/${uuid}`;
-    this._extensionPath = `/extension/${uuid}`;
+    this._connectionId = crypto.randomUUID();
+    this._cdpPath = `/cdp/${this._connectionId}`;
+    this._extensionPath = `/extension/${this._connectionId}`;
 
     void this._extensionConnectionPromise.catch(logUnhandledError);
     this._wss = new wsServer({ server });
@@ -117,6 +120,8 @@ export class CDPRelayServer {
     const mcpRelayEndpoint = `${this._wsHost}${this._extensionPath}`;
     const url = new URL(`chrome-extension://${playwrightExtensionId}/connect.html`);
     url.searchParams.set('mcpRelayUrl', mcpRelayEndpoint);
+    url.searchParams.set('taskId', this._taskId);
+    url.searchParams.set('connectionId', this._connectionId);
     const client = {
       name: clientName,
       // Not used anymore.
@@ -356,10 +361,11 @@ class ExtensionConnection {
     }
   }
 
-  private _onClose(event: websocket.CloseEvent) {
-    debugLogger(`<ws closed> code=${event.code} reason=${event.reason}`);
+  private _onClose(code: number, reason: Buffer) {
+    const reasonText = reason.toString();
+    debugLogger(`<ws closed> code=${code} reason=${reasonText}`);
     this._dispose();
-    this.onclose?.(event.reason);
+    this.onclose?.(reasonText);
   }
 
   private _onError(event: websocket.ErrorEvent) {
