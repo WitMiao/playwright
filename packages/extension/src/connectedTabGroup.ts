@@ -15,50 +15,14 @@
  */
 
 import { RelayConnection, debugLog } from './relayConnection';
+import { groupTitleForTask, removeTaskResources, storeTaskResources } from './taskResources';
 
-const PLAYWRIGHT_GROUP_TITLE = 'Playwright';
-const PLAYWRIGHT_GROUP_TITLE_PREFIX = `${PLAYWRIGHT_GROUP_TITLE} · `;
-// Green first, so a lone connection keeps the familiar look.
-const PLAYWRIGHT_GROUP_COLORS: GroupColor[] = ['green', 'blue', 'purple', 'orange', 'pink', 'cyan', 'yellow', 'red'];
-const NON_DEBUGGABLE_SCHEMES = ['chrome:', 'edge:', 'devtools:'];
+const PLAYWRIGHT_GROUP_COLOR = 'green';
+const NON_DEBUGGABLE_SCHEMES = ['chrome:', 'chrome-extension:', 'edge:', 'devtools:'];
 const CONNECTED_BADGE = { text: '✓', color: '#4CAF50', title: 'Connected to Playwright client' };
 
 export function isNonDebuggableUrl(url: string | undefined): boolean {
   return !!url && NON_DEBUGGABLE_SCHEMES.some(s => url.startsWith(s));
-}
-
-type GroupColor = `${chrome.tabGroups.Color}`;
-
-export type GroupStyle = {
-  title: string;
-  color: GroupColor;
-};
-
-export function uniqueGroupStyle(clientName: string | undefined, taken: readonly GroupStyle[]): GroupStyle {
-  const titles = new Set(taken.map(style => style.title));
-  const base = PLAYWRIGHT_GROUP_TITLE_PREFIX + (clientName || 'unknown');
-  let title = base;
-  for (let i = 2; titles.has(title); i++)
-    title = `${base} (${i})`;
-
-  const colors = new Set(taken.map(style => style.color));
-  const color = PLAYWRIGHT_GROUP_COLORS.find(candidate => !colors.has(candidate)) ?? PLAYWRIGHT_GROUP_COLORS[0];
-  return { title, color };
-}
-
-// Ungroups any Playwright-titled groups left behind by a prior service worker.
-export async function cleanupStalePlaywrightGroups(): Promise<void> {
-  try {
-    const groups = await chrome.tabGroups.query({});
-    // The bare title comes from versions that predate per-client groups.
-    const stale = groups.filter(g => g.title === PLAYWRIGHT_GROUP_TITLE || g.title?.startsWith(PLAYWRIGHT_GROUP_TITLE_PREFIX));
-    const tabsPerGroup = await Promise.all(stale.map(g => chrome.tabs.query({ groupId: g.id })));
-    const tabIds = tabsPerGroup.flat().map(t => t.id).filter((id): id is number => id !== undefined);
-    if (tabIds.length)
-      await ungroupTabs(tabIds);
-  } catch (error: any) {
-    debugLog('Error cleaning up stale groups:', error);
-  }
 }
 
 // The Playwright tab group for an active RelayConnection. The Chrome tab group
@@ -70,29 +34,46 @@ export async function cleanupStalePlaywrightGroups(): Promise<void> {
 // `_groupTabIds` caches group membership from Chrome events so hot-path checks
 // in `_onTabUpdated` stay synchronous.
 export class ConnectedTabGroup {
-  readonly clientName: string | undefined;
-  readonly groupStyle: GroupStyle;
   private _connection: RelayConnection;
-  private _isTabReserved: (tabId: number) => boolean;
+  private _connectionId: string;
+  private _groupTitle: string;
+  private _isTabClaimedByOtherTask: (tabId: number) => boolean;
   private _groupId: number | null = null;
   private _groupTabIds: Set<number> = new Set();
-  private _onTabUpdatedListener: (tabId: number, changeInfo: chrome.tabs.TabChangeInfo, tab: chrome.tabs.Tab) => void;
+  private _groupingTabIds: Set<number> = new Set();
+  private _leavingTabIds: Set<number> = new Set();
+  private _ownedTabIds: Set<number> = new Set();
+  private _closingOwnedTabIds: Set<number> = new Set();
+  private _onTabAttachedToWindowListener: (tabId: number, attachInfo: chrome.tabs.OnAttachedInfo) => void;
+  private _onTabUpdatedListener: (tabId: number, changeInfo: chrome.tabs.OnUpdatedInfo, tab: chrome.tabs.Tab) => void;
+  private _onTabCreatedListener: (tab: chrome.tabs.Tab) => void;
   private _onTabRemovedListener: (tabId: number) => void;
+  private _groupUpdate = Promise.resolve();
+  private _resourceUpdate = Promise.resolve();
+  private _closed = false;
 
   onclose?: () => void;
 
-  constructor(connection: RelayConnection, selectedTab: chrome.tabs.Tab, clientName: string | undefined, groupStyle: GroupStyle, isTabReserved: (tabId: number) => boolean) {
-    this.clientName = clientName;
-    this.groupStyle = groupStyle;
-    this._isTabReserved = isTabReserved;
+  constructor(connection: RelayConnection, selectedTab: chrome.tabs.Tab, connectionId: string, taskId: string, selectedTabOwned: boolean, isTabClaimedByOtherTask: (tabId: number) => boolean = () => false) {
     this._connection = connection;
+    this._connectionId = connectionId;
+    this._groupTitle = groupTitleForTask(taskId, connectionId);
+    this._isTabClaimedByOtherTask = isTabClaimedByOtherTask;
     this._connection.onclose = () => this._onConnectionClose();
     this._connection.ontabattached = (tabId: number) => this._onTabAttached(tabId);
     this._connection.ontabdetached = (tabId: number) => this._onTabDetached(tabId);
+    this._connection.onownedtabcreated = (tabId: number) => this._onOwnedTabCreated(tabId);
+    this._connection.setTargetWindow(selectedTab.windowId);
+    this._onTabAttachedToWindowListener = this._onTabAttachedToWindow.bind(this);
     this._onTabUpdatedListener = this._onTabUpdated.bind(this);
+    this._onTabCreatedListener = this._onTabCreated.bind(this);
     this._onTabRemovedListener = this._onTabRemoved.bind(this);
+    chrome.tabs.onAttached.addListener(this._onTabAttachedToWindowListener);
     chrome.tabs.onUpdated.addListener(this._onTabUpdatedListener);
+    chrome.tabs.onCreated.addListener(this._onTabCreatedListener);
     chrome.tabs.onRemoved.addListener(this._onTabRemovedListener);
+    if (selectedTabOwned)
+      this._ownedTabIds.add(selectedTab.id!);
     // Seed the relay with the user-selected tab, then close out the initial
     // handshake. The relay holds Playwright-side CDP traffic until
     // `didInitialize` arrives, so it sees a fully populated tab model by the
@@ -102,21 +83,33 @@ export class ConnectedTabGroup {
   }
 
   connectedTabIds(): number[] {
-    return [...this._groupTabIds];
+    return [...new Set([...this._groupTabIds, ...this._connection.claimedTabs])];
+  }
+
+  claimedTabIds(): number[] {
+    return [...new Set([...this.connectedTabIds(), ...this._groupingTabIds, ...this._leavingTabIds, ...this._ownedTabIds, ...this._closingOwnedTabIds])];
+  }
+
+  groupId(): number | null {
+    return this._groupId;
   }
 
   close(reason: string): void {
     this._connection.close(reason);
   }
 
-  releaseTab(tabId: number): void {
-    if (!this._groupTabIds.has(tabId))
+  private _onTabAttachedToWindow(tabId: number, attachInfo: chrome.tabs.OnAttachedInfo): void {
+    if (this._closed || !this._groupTabIds.has(tabId))
       return;
-    this._groupTabIds.delete(tabId);
-    this._connection.detachTab(tabId);
+    void chrome.tabs.get(tabId).then(tab => {
+      if (!this._closed && tab.groupId === this._groupId)
+        this._connection.setTargetWindow(attachInfo.newWindowId);
+    }).catch(() => {});
   }
 
-  private _onTabUpdated(tabId: number, changeInfo: chrome.tabs.TabChangeInfo, tab: chrome.tabs.Tab): void {
+  private _onTabUpdated(tabId: number, changeInfo: chrome.tabs.OnUpdatedInfo, tab: chrome.tabs.Tab): void {
+    if (this._closed)
+      return;
     if (changeInfo.groupId !== undefined)
       this._onTabGroupChanged(tabId, tab);
     if (changeInfo.url === undefined)
@@ -133,15 +126,17 @@ export class ConnectedTabGroup {
   // detaches on exit; a chrome:// tab stays in the group until it navigates
   // (handled in _onTabUpdated).
   private _onTabGroupChanged(tabId: number, tab: chrome.tabs.Tab): void {
+    if (this._closed)
+      return;
     const inOurGroup = this._groupId !== null && tab.groupId === this._groupId;
     const wasInGroup = this._groupTabIds.has(tabId);
     if (inOurGroup === wasInGroup)
       return;
     if (inOurGroup) {
-      // Chrome may drop the connect page of a client that is still connecting
-      // into our group; that tab is spoken for.
-      if (this._isTabReserved(tabId)) {
-        void ungroupTabs([tabId]);
+      if (this._isTabClaimedByOtherTask(tabId)) {
+        void this._ungroupTabsStillInGroup([tabId], this._groupId!).catch(error => {
+          debugLog('Error rejecting tab claimed by another task:', error);
+        });
         return;
       }
       this._groupTabIds.add(tabId);
@@ -149,18 +144,50 @@ export class ConnectedTabGroup {
         this._connection.attachTab(tab);
     } else {
       this._groupTabIds.delete(tabId);
-      if (this._connection.attachedTabs.has(tabId))
-        this._connection.detachTab(tabId);
+      this._leavingTabIds.add(tabId);
+      queueMicrotask(() => {
+        if (this._connection.attachedTabs.has(tabId))
+          this._connection.detachTab(tabId);
+        this._leavingTabIds.delete(tabId);
+      });
     }
+    this._persistResources();
   }
 
   private _onTabRemoved(tabId: number): void {
     this._groupTabIds.delete(tabId);
+    this._leavingTabIds.delete(tabId);
+    this._ownedTabIds.delete(tabId);
+    this._persistResources();
+  }
+
+  // Chrome creates tabs directly inside the opener's group. They never emit a
+  // groupId transition, so observe creation itself. Ownership is recorded
+  // separately by RelayConnection for tabs that originate from the task;
+  // a user-created tab in this group remains borrowed.
+  private _onTabCreated(tab: chrome.tabs.Tab): void {
+    if (this._closed || this._groupId === null || tab.groupId !== this._groupId || tab.id === undefined)
+      return;
+    this._groupTabIds.add(tab.id);
+    if (!isNonDebuggableUrl(tab.url))
+      this._connection.attachTab(tab);
+    this._persistResources();
   }
 
   private _onTabAttached(tabId: number): void {
+    if (this._closed)
+      return;
     void this._updateBadge(tabId, CONNECTED_BADGE);
     void this._addTabToGroup(tabId);
+  }
+
+  private _onOwnedTabCreated(tabId: number): void {
+    if (this._closed) {
+      void chrome.tabs.remove(tabId).catch(() => {});
+      return;
+    }
+    this._ownedTabIds.add(tabId);
+    this._persistResources();
   }
 
   // The debugger detached (drag-out, tab close, or external action). Clear the
@@ -171,13 +198,38 @@ export class ConnectedTabGroup {
   }
 
   private _onConnectionClose(): void {
+    if (this._closed)
+      return;
+    this._closed = true;
+    chrome.tabs.onAttached.removeListener(this._onTabAttachedToWindowListener);
     chrome.tabs.onUpdated.removeListener(this._onTabUpdatedListener);
+    chrome.tabs.onCreated.removeListener(this._onTabCreatedListener);
     chrome.tabs.onRemoved.removeListener(this._onTabRemovedListener);
-    const groupTabs = [...this._groupTabIds];
+    const ownedTabs = [...this._ownedTabIds];
+    const borrowedTabs = [...this._groupTabIds].filter(tabId => !this._ownedTabIds.has(tabId));
+    const groupId = this._groupId;
+    // Owned tabs are going to be deleted, so keep them claimed until cleanup
+    // finishes and the background removes this group from active connections.
+    this._closingOwnedTabIds = new Set(ownedTabs);
     this._groupTabIds.clear();
-    if (groupTabs.length)
-      void ungroupTabs(groupTabs);
-    this.onclose?.();
+    this._ownedTabIds.clear();
+    void this._cleanupResources(ownedTabs, borrowedTabs, groupId).finally(() => {
+      this._closingOwnedTabIds.clear();
+      this.onclose?.();
+    });
+  }
+
+  private async _cleanupResources(ownedTabs: number[], borrowedTabs: number[], groupId: number | null): Promise<void> {
+    await this._groupUpdate;
+    await this._resourceUpdate;
+    if (ownedTabs.length)
+      await chrome.tabs.remove(ownedTabs).catch(error => debugLog('Error closing owned tabs on close:', error));
+    if (borrowedTabs.length && groupId !== null) {
+      await this._ungroupTabsStillInGroup(borrowedTabs, groupId).catch(error => {
+        debugLog('Error ungrouping borrowed tabs on close:', error);
+      });
+    }
+    await removeTaskResources(this._connectionId).catch(error => debugLog('Error removing task resource record:', error));
   }
 
   private async _updateBadge(tabId: number, { text, color, title }: { text: string; color?: string, title?: string }): Promise<void> {
@@ -196,50 +248,90 @@ export class ConnectedTabGroup {
   // first use. `_groupTabIds` is updated after the await so an onUpdated event
   // that arrives concurrently (`_groupId` still null, wasInGroup still false)
   // becomes a harmless no-op rather than taking the drag-out branch.
-  private async _addTabToGroup(tabId: number): Promise<void> {
-    if (this._groupTabIds.has(tabId))
+  private _addTabToGroup(tabId: number): Promise<void> {
+    if (this._closed || this._groupTabIds.has(tabId) || this._groupingTabIds.has(tabId))
+      return Promise.resolve();
+    this._groupingTabIds.add(tabId);
+    const update = this._groupUpdate
+        .then(() => this._addTabToGroupNow(tabId))
+        .finally(() => this._groupingTabIds.delete(tabId));
+    this._groupUpdate = update.catch(() => {});
+    return update;
+  }
+
+  private async _addTabToGroupNow(tabId: number): Promise<void> {
+    if (this._closed || this._groupTabIds.has(tabId))
       return;
     try {
-      await retryOnDrag(async () => {
+      await this._retryOnDrag(async () => {
         if (this._groupId === null) {
           this._groupId = await chrome.tabs.group({ tabIds: [tabId] });
-          await chrome.tabGroups.update(this._groupId, this.groupStyle);
+          await chrome.tabGroups.update(this._groupId, { color: PLAYWRIGHT_GROUP_COLOR, title: this._groupTitle });
         } else {
           await chrome.tabs.group({ groupId: this._groupId, tabIds: [tabId] });
         }
       });
+      if (this._closed) {
+        if (this._ownedTabIds.has(tabId))
+          await chrome.tabs.remove(tabId).catch(() => {});
+        else if (this._groupId !== null)
+          await this._ungroupTabsStillInGroup([tabId], this._groupId).catch(() => {});
+        return;
+      }
       this._groupTabIds.add(tabId);
+      this._persistResources();
     } catch (error: any) {
       debugLog('Error adding tab to group:', error);
     }
   }
 
-}
-
-export async function ungroupTabs(tabIds: number[]): Promise<void> {
-  try {
-    await retryOnDrag(() => chrome.tabs.ungroup(tabIds));
-  } catch (error: any) {
-    debugLog('Error ungrouping tabs:', error);
-  }
-}
-
-// Chrome throws "user may be dragging a tab" while a drag is in progress.
-// Retry with backoff until it clears (or we give up).
-async function retryOnDrag(fn: () => Promise<void>): Promise<void> {
-  const delays = [0, 100, 200, 400, 800];
-  let lastError: unknown;
-  for (const delay of delays) {
-    if (delay)
-      await new Promise(resolve => setTimeout(resolve, delay));
-    try {
-      await fn();
+  private _persistResources(): void {
+    if (this._closed || this._groupId === null)
       return;
-    } catch (error: any) {
-      if (!error?.message?.includes('user may be dragging a tab'))
-        throw error;
-      lastError = error;
-    }
+    const resources = {
+      version: 1 as const,
+      connectionId: this._connectionId,
+      groupId: this._groupId,
+      groupTitle: this._groupTitle,
+      tabIds: [...this._groupTabIds],
+      ownedTabIds: [...this._ownedTabIds],
+    };
+    this._resourceUpdate = this._resourceUpdate
+        .then(() => storeTaskResources(resources))
+        .catch(error => debugLog('Error storing task resources:', error));
   }
-  throw lastError;
+
+  private async _ungroupTabsStillInGroup(tabIds: number[], groupId: number): Promise<void> {
+    await this._retryOnDrag(async () => {
+      const matchingTabIds = (await Promise.all(tabIds.map(async tabId => {
+        const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+        return tab?.groupId === groupId ? tabId : undefined;
+      }))).filter((tabId): tabId is number => tabId !== undefined);
+      if (!matchingTabIds.length)
+        return;
+      const [firstTabId, ...otherTabIds] = matchingTabIds;
+      const ungroupTabIds = otherTabIds.length ? [firstTabId, ...otherTabIds] as [number, ...number[]] : firstTabId;
+      await chrome.tabs.ungroup(ungroupTabIds);
+    });
+  }
+
+  // Chrome throws "user may be dragging a tab" while a drag is in progress.
+  // Retry with backoff until it clears (or we give up).
+  private async _retryOnDrag(fn: () => Promise<void>): Promise<void> {
+    const delays = [0, 100, 200, 400, 800];
+    let lastError: unknown;
+    for (const delay of delays) {
+      if (delay)
+        await new Promise(resolve => setTimeout(resolve, delay));
+      try {
+        await fn();
+        return;
+      } catch (error: any) {
+        if (!error?.message?.includes('user may be dragging a tab'))
+          throw error;
+        lastError = error;
+      }
+    }
+    throw lastError;
+  }
 }

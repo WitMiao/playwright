@@ -146,9 +146,14 @@ export function decorateMCPCommand(command: Command) {
                   return;
                 }
 
-                testDebug('close browser');
                 if (sharedBrowserPromise === promise)
                   sharedBrowserPromise = undefined;
+                if (config.extension) {
+                  testDebug('disconnect extension browser');
+                  await browser.close().catch(() => { });
+                  return;
+                }
+                testDebug('close browser');
                 await browserContext.close().catch(() => { });
                 await browser.close().catch(() => { });
               });

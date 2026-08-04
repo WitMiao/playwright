@@ -65,6 +65,8 @@ export class CDPRelayServer {
   private _wsServer: WSServer;
   private _wsHost!: string;
   private _browserChannel: string;
+  private _taskId: string;
+  private _connectionId: string;
   private _executablePath?: string;
   private _customUserDataDir?: string;
   private _profileDirectory?: string;
@@ -77,8 +79,9 @@ export class CDPRelayServer {
   private _handler: ExtensionProtocolV2;
   private _extensionConnectionPromise = new ManualPromise<void>();
 
-  constructor(browserChannel: string, executablePath?: string, customUserDataDir?: string, profileDirectory?: string) {
+  constructor(browserChannel: string, executablePath?: string, customUserDataDir?: string, profileDirectory?: string, taskId = 'Playwright MCP') {
     this._browserChannel = browserChannel;
+    this._taskId = taskId;
     this._executablePath = executablePath;
     this._customUserDataDir = customUserDataDir;
     this._profileDirectory = profileDirectory;
@@ -92,9 +95,9 @@ export class CDPRelayServer {
     };
     this._handler = new ExtensionProtocolV2(sendCommand);
 
-    const uuid = crypto.randomUUID();
-    this._cdpPath = `/cdp/${uuid}`;
-    this._extensionPath = `/extension/${uuid}`;
+    this._connectionId = crypto.randomUUID();
+    this._cdpPath = `/cdp/${this._connectionId}`;
+    this._extensionPath = `/extension/${this._connectionId}`;
 
     void this._extensionConnectionPromise.catch(logUnhandledError);
     this._wsServer = new WSServer({
@@ -149,6 +152,8 @@ export class CDPRelayServer {
     const mcpRelayEndpoint = `${this._wsHost}${this._extensionPath}`;
     const url = new URL(`chrome-extension://${playwrightExtensionId}/connect.html`);
     url.searchParams.set('mcpRelayUrl', mcpRelayEndpoint);
+    url.searchParams.set('taskId', this._taskId);
+    url.searchParams.set('connectionId', this._connectionId);
     const client = {
       name: clientName,
       // Not used anymore.
