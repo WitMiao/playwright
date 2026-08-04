@@ -447,6 +447,28 @@ test(`bypass connection dialog with token`, async ({ browserWithExtension, start
   await expect(page.locator('.client-info')).toContainText(`Connected client: "${clientName}"`);
 });
 
+test(`CLI attach fails fast when the extension token is rejected`, async ({ browserWithExtension, cli }) => {
+  const browserContext = await browserWithExtension.launch();
+  const confirmationPagePromise = browserContext.waitForEvent('page', page =>
+    page.url().startsWith(`chrome-extension://${extensionId}/connect.html`)
+  );
+  const invalidToken = 'invalid-token-must-not-appear-in-errors';
+  const startTime = Date.now();
+  const resultPromise = cli(['-s=invalid-token', 'attach', '--extension=chromium'], {
+    env: {
+      PLAYWRIGHT_MCP_EXTENSION_TOKEN: invalidToken,
+      PWTEST_EXTENSION_USER_DATA_DIR: browserWithExtension.userDataDir,
+    },
+  });
+
+  const confirmationPage = await confirmationPagePromise;
+  const result = await resultPromise;
+  const output = `${result.output}\n${result.error}`;
+  expect(output).toContain('Playwright Extension rejected the authentication token.');
+  expect(output).not.toContain(invalidToken);
+  expect(Date.now() - startTime).toBeLessThan(5000);
+  await expect(confirmationPage.locator('.status-banner')).toContainText('Invalid token provided.');
+});
 
 test(`reconnects after the extension connection drops`, {
   annotation: { type: 'issue', description: 'https://github.com/microsoft/playwright/issues/41874' },

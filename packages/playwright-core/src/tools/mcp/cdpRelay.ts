@@ -156,6 +156,9 @@ export class CDPRelayServer {
     if (os.platform() === 'linux' && channel === 'chromium')
       args.push('--no-sandbox');
     args.push(href);
+    const testExecutableArg = process.env.PWTEST_EXTENSION_EXECUTABLE_ARG;
+    if (testExecutableArg)
+      args.unshift(testExecutableArg);
     spawn(executablePath, args, {
       windowsHide: true,
       detached: true,
