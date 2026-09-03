@@ -41,11 +41,7 @@ export async function createExtensionBrowser(channel: string, executablePath: st
   try {
     await relay.establishExtensionConnection(clientName);
     const browser = await playwright.chromium.connectOverCDP(relay.cdpEndpoint(), { isLocal: true, timeout: 0, noDefaults: true });
-    // Extension mode attaches to the user's browser. Browser.close() must tear
-    // down only this Playwright connection, not forward Browser.close over CDP.
-    // eslint-disable-next-line no-restricted-syntax
-    (browser as any)._shouldCloseConnectionOnClose = true;
-    browser.once('disconnected', () => relay.stop());
+    browser.on('disconnected', () => relay.stop());
     return browser;
   } catch (error) {
     relay.stop();

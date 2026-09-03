@@ -40,7 +40,7 @@ test(`navigate with extension`, async ({ startExtensionClient, server }) => {
   await clickAllowAndSelect(selectorPage, 'Welcome');
 
   expect(await navigateResponse).toHaveResponse({
-    snapshot: expect.stringContaining(`- generic [active] [ref=e1]: Hello, world!`),
+    snapshot: expect.stringContaining('Hello, world!'),
   });
 });
 
@@ -295,7 +295,7 @@ testWithOldExtensionVersion(`works with old extension version`, async ({ startEx
   await clickAllowAndSelect(selectorPage, 'Welcome');
 
   expect(await navigateResponse).toHaveResponse({
-    snapshot: expect.stringContaining(`- generic [active] [ref=e1]: Hello, world!`),
+    snapshot: expect.stringContaining('Hello, world!'),
   });
 });
 

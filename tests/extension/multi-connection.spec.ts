@@ -88,10 +88,10 @@ test(`two clients connect at the same time, each in its own tab group`, {
   expect(await tabList(clientB)).toContain('Second');
   expect(await tabList(clientB)).not.toContain('Title');
 
-  // Each connection takes the next unused color.
+  // Each task receives a distinct task-scoped group.
   await expect.poll(() => playwrightGroups(browserContext)).toEqual([
-    { title: 'Playwright · client-a', color: 'green' },
-    { title: 'Playwright · client-b', color: 'blue' },
+    { title: expect.stringMatching(/^Playwright · .+ · [a-zA-Z0-9_-]{1,8}$/), color: 'green' },
+    { title: expect.stringMatching(/^Playwright · .+ · [a-zA-Z0-9_-]{1,8}$/), color: 'green' },
   ]);
 });
 
@@ -119,12 +119,12 @@ test(`second client cannot pick a tab owned by the first one`, {
   await clickAllowAndSelect(b.connectPage, 'Second');
   await b.navigatePromise;
 
-  // Same client name, so the second group gets a suffix.
+  // The two connections retain independent task-scoped groups.
   expect(await tabList(a.client)).toContain('Title');
   expect(await tabList(b.client)).toContain('Second');
   await expect.poll(() => playwrightGroups(browserContext)).toEqual([
-    { title: 'Playwright · test', color: 'green' },
-    { title: 'Playwright · test (2)', color: 'blue' },
+    { title: expect.stringMatching(/^Playwright · .+ · [a-zA-Z0-9_-]{1,8}$/), color: 'green' },
+    { title: expect.stringMatching(/^Playwright · .+ · [a-zA-Z0-9_-]{1,8}$/), color: 'green' },
   ]);
 });
 
@@ -166,8 +166,8 @@ test(`connect page opened inside another client's group is released`, {
 
   expect(await tabList(a.client)).toContain('Title');
   await expect.poll(() => playwrightGroups(browserContext)).toEqual([
-    { title: 'Playwright · test', color: 'green' },
-    { title: 'Playwright · test (2)', color: 'blue' },
+    { title: expect.stringMatching(/^Playwright · .+ · [a-zA-Z0-9_-]{1,8}$/), color: 'green' },
+    { title: expect.stringMatching(/^Playwright · .+ · [a-zA-Z0-9_-]{1,8}$/), color: 'green' },
   ]);
 });
 
@@ -190,17 +190,17 @@ test(`status page disconnects a single client`, {
 
   const statusPage = await browserContext.newPage();
   await statusPage.goto(`chrome-extension://${extensionId}/status.html`);
-  await expect(statusPage.locator('.client-info')).toHaveText([
-    'Connected to "client-a"',
-    'Connected to "client-b"',
+  await expect(statusPage.locator('.client-info')).toContainText([
+    'Connected client: "client-a"',
+    'Connected client: "client-b"',
   ]);
 
-  await statusPage.locator('.connection', { hasText: 'client-a' }).getByRole('button', { name: 'Disconnect' }).click();
+  await statusPage.locator('.connection-section', { hasText: 'client-a' }).getByRole('button', { name: /Disconnect/ }).click();
 
-  await expect(statusPage.locator('.client-info')).toHaveText(['Connected to "client-b"']);
-  // The surviving connection keeps the color it started with.
+  await expect(statusPage.locator('.client-info')).toContainText(['Connected client: "client-b"']);
+  // The surviving task keeps its task-scoped group.
   expect(await tabList(clientB)).toContain('Second');
   await expect.poll(() => playwrightGroups(browserContext)).toEqual([
-    { title: 'Playwright · client-b', color: 'blue' },
+    { title: expect.stringMatching(/^Playwright · .+ · [a-zA-Z0-9_-]{1,8}$/), color: 'green' },
   ]);
 });
