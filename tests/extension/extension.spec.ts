@@ -573,7 +573,7 @@ test(`bypass connection dialog with token`, async ({ browserWithExtension, start
   await expect(page.locator('.client-info')).toContainText(`Connected client: "${clientName}"`);
 });
 
-test(`times out when the extension rejects the token`, {
+test(`rejects an invalid extension token and allows retry`, {
   annotation: { type: 'issue', description: 'https://github.com/microsoft/playwright-mcp/issues/1732' },
 }, async ({ startExtensionClient, server }) => {
   const { browserContext, client } = await startExtensionClient({
@@ -587,7 +587,7 @@ test(`times out when the extension rejects the token`, {
     name: 'browser_navigate',
     arguments: { url: server.HELLO_WORLD },
   })).toHaveResponse({
-    error: expect.stringContaining(`Playwright extension did not connect within 0.5s after opening the connect page. Make sure the extension is installed in the Chrome profile "Default" and PLAYWRIGHT_MCP_EXTENSION_TOKEN matches its token.`),
+    error: expect.stringContaining('Playwright Extension rejected the authentication token.'),
     isError: true,
   });
   await expect((await connectPagePromise).locator('.status-banner')).toContainText('Invalid token provided.');

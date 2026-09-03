@@ -67,20 +67,29 @@ class MockWebSocket {
   }
 }
 
-test('relay-created tab is claimed before its response is sent', async () => {
+test('relay-created tab stays in the task window without stealing focus', async () => {
   const originalChrome = globalThis.chrome;
   const originalWebSocket = globalThis.WebSocket;
   const debuggerOnEvent = new MockEvent();
   const debuggerOnDetach = new MockEvent();
   const tabsOnCreated = new MockEvent();
   const tabsOnRemoved = new MockEvent();
+  const createCalls: chrome.tabs.CreateProperties[] = [];
+  const debuggerCommandCalls: unknown[][] = [];
   globalThis.chrome = {
     debugger: {
       onDetach: debuggerOnDetach,
       onEvent: debuggerOnEvent,
+      sendCommand: async (...args: unknown[]) => {
+        debuggerCommandCalls.push(args);
+        return {};
+      },
     },
     tabs: {
-      create: async () => ({ id: 9, windowId: 1, url: 'about:blank' }),
+      create: async (properties: chrome.tabs.CreateProperties) => {
+        createCalls.push(properties);
+        return { id: 9, windowId: 42, url: 'about:blank' };
+      },
       onCreated: tabsOnCreated,
       onRemoved: tabsOnRemoved,
     },
@@ -89,6 +98,7 @@ test('relay-created tab is claimed before its response is sent', async () => {
   const webSocket = new MockWebSocket('ws://relay');
   const relay = new RelayConnection(webSocket as any);
   try {
+    relay.setTargetWindow(42);
     webSocket.onmessage?.({ data: JSON.stringify({
       id: 1,
       method: 'chrome.tabs.create',
@@ -98,7 +108,16 @@ test('relay-created tab is claimed before its response is sent', async () => {
       id: 1,
       result: expect.objectContaining({ id: 9 }),
     });
+    expect(createCalls).toEqual([{ url: 'about:blank', active: false, windowId: 42 }]);
     expect(relay.claimedTabs).toContain(9);
+
+    webSocket.onmessage?.({ data: JSON.stringify({
+      id: 2,
+      method: 'chrome.debugger.sendCommand',
+      params: [{ tabId: 9 }, 'Page.bringToFront'],
+    }) } as MessageEvent);
+    await expect.poll(() => webSocket.sentMessages).toContainEqual({ id: 2, result: {} });
+    expect(debuggerCommandCalls).toEqual([]);
   } finally {
     relay.close('test complete');
     globalThis.chrome = originalChrome;

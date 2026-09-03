@@ -15,7 +15,6 @@
  */
 
 import fs from 'fs';
-import http from 'http';
 import ws from 'ws';
 
 import { test, expect } from './cli-fixtures';
@@ -33,9 +32,8 @@ test('extension token rejection aborts the pending relay connection', async () =
   };
   (globalThis as any).WebSocket = ws;
 
-  const httpServer = http.createServer();
-  await new Promise<void>(resolve => httpServer.listen(0, '127.0.0.1', resolve));
-  const relay = new CDPRelayServer(httpServer, 'chromium', process.execPath);
+  const relay = new CDPRelayServer('chromium', process.execPath);
+  await relay.start();
   const connectionPromise = relay.establishExtensionConnection('invalid-token-test');
   const connectionResult = connectionPromise.catch(e => e);
   const startTime = Date.now();
@@ -57,7 +55,6 @@ test('extension token rejection aborts the pending relay connection', async () =
     expect(Date.now() - startTime).toBeLessThan(5000);
   } finally {
     relay.stop();
-    await new Promise<void>(resolve => httpServer.close(() => resolve()));
     (globalThis as any).chrome = originalChrome;
     (globalThis as any).WebSocket = originalWebSocket;
   }
