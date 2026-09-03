@@ -98,6 +98,13 @@ export class ConnectedTabGroup {
     this._connection.close(reason);
   }
 
+  releaseTab(tabId: number): void {
+    if (this._ownedTabIds.has(tabId) || !this._groupTabIds.delete(tabId))
+      return;
+    this._connection.detachTab(tabId);
+    this._persistResources();
+  }
+
   private _onTabAttachedToWindow(tabId: number, attachInfo: chrome.tabs.OnAttachedInfo): void {
     if (this._closed || !this._groupTabIds.has(tabId))
       return;

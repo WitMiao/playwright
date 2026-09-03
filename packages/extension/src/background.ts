@@ -67,16 +67,20 @@ class PlaywrightExtension {
   // Promise-based message handling is not supported in Chrome: https://issues.chromium.org/issues/40753031
   private _onMessage(message: PageMessage, sender: chrome.runtime.MessageSender, sendResponse: (response: any) => void) {
     switch (message.type) {
-      case 'connectionRequested':
-        this._pendingConnections.create(sender.tab!.id!, {
-          mcpRelayUrl: message.mcpRelayUrl,
-          connectionId: message.connectionId || crypto.randomUUID(),
-          taskId: message.taskId || 'Playwright',
+      case 'connectionRequested': {
+        const selectorTabId = sender.tab!.id!;
+        this._releaseConnectPage(selectorTabId).then(() => {
+          this._pendingConnections.create(selectorTabId, {
+            mcpRelayUrl: message.mcpRelayUrl,
+            connectionId: message.connectionId || crypto.randomUUID(),
+            taskId: message.taskId || 'Playwright',
+          });
+          sendResponse({ success: true });
         });
-        sendResponse({ success: true });
-        return false;
+        return true;
+      }
       case 'getTabs':
-        this._getTabs().then(
+        this._getTabs(sender.tab?.id).then(
             tabs => sendResponse({ success: true, tabs, currentTabId: sender.tab?.id }),
             (error: any) => sendResponse({ success: false, error: error.message }));
         return true;
@@ -177,7 +181,8 @@ class PlaywrightExtension {
           chrome.windows.update(selectedTab.windowId, { focused: true }),
         ]).catch(() => {});
       }
-      await chrome.tabs.remove(selectorTabId).catch(() => {});
+      if (selectedTab.id !== selectorTabId)
+        await chrome.tabs.remove(selectorTabId).catch(() => {});
     } catch (error: any) {
       acceptedConnection?.close(error.message);
       if (reservedTabId !== undefined)
@@ -190,10 +195,21 @@ class PlaywrightExtension {
     }
   }
 
-  private async _getTabs(): Promise<chrome.tabs.Tab[]> {
+  // Chrome can inherit the active tab group when opening the connect page.
+  // It is never part of another task, so detach and ungroup it before showing
+  // the selector while leaving task-owned tabs protected.
+  private async _releaseConnectPage(tabId: number): Promise<void> {
+    for (const connection of this._activeConnections.values())
+      connection.group.releaseTab(tabId);
+    const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+    if (tab && tab.groupId !== chrome.tabs.TAB_ID_NONE)
+      await chrome.tabs.ungroup(tabId).catch(() => {});
+  }
+
+  private async _getTabs(selectorTabId: number | undefined): Promise<chrome.tabs.Tab[]> {
     const tabs = await chrome.tabs.query({});
     const claimedTabIds = this._claimedTabIds();
-    return tabs.filter(tab => !isNonDebuggableUrl(tab.url) && (tab.id === undefined || !claimedTabIds.has(tab.id)));
+    return tabs.filter(tab => tab.id === selectorTabId || (!isNonDebuggableUrl(tab.url) && (tab.id === undefined || !claimedTabIds.has(tab.id))));
   }
 
   private _claimedTabIds(): Set<number> {
