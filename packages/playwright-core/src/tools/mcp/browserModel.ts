@@ -139,7 +139,7 @@ export class BrowserModel {
   }
 
   async createTarget(url: string | undefined): Promise<{ targetId: string | undefined }> {
-    const tab = await this._sendToExtension('chrome.tabs.create', [{ url }]);
+    const tab = await this._sendToExtension('chrome.tabs.create', [{ url, active: false }]);
     if (tab?.id === undefined)
       throw new Error('Failed to create tab');
     this._knownTabs.set(tab.id, tab);
