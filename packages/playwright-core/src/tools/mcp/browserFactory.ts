@@ -60,7 +60,7 @@ export async function createBrowserWithInfo(config: FullConfig, clientInfo: Clie
     ownership = 'own';
   } else if (config.extension) {
     const { channel, executablePath, profileDirName } = resolveExtensionOptions(cliOptions);
-    browser = await createExtensionBrowser(channel, executablePath, config.browser.userDataDir, profileDirName, clientInfo.clientName);
+    browser = await createExtensionBrowser(channel, executablePath, config.browser.userDataDir, profileDirName, clientInfo.clientName, clientInfo.taskId);
     ownership = 'attached';
   } else {
     browser = await createPersistentBrowser(config, clientInfo);
