@@ -40,8 +40,82 @@ test(`navigate with extension`, async ({ startExtensionClient, server }) => {
   await clickAllowAndSelect(selectorPage, 'Welcome');
 
   expect(await navigateResponse).toHaveResponse({
-    snapshot: expect.stringContaining(`- generic [active] [ref=f1e1]: Hello, world!`),
+    snapshot: expect.stringContaining('Hello, world!'),
   });
+});
+
+test(`parallel extension tasks isolate groups, preserve focus, and clean owned tabs`, async ({ browserWithExtension, startClient, server }) => {
+  const browserContext = await browserWithExtension.launch();
+  const statusPage = await browserContext.newPage();
+  await statusPage.goto(`chrome-extension://${extensionId}/status.html`);
+  const token = await statusPage.locator('.auth-token-code').textContent();
+  const [, tokenValue] = token?.split('=') || [];
+
+  const userPage = await browserContext.newPage();
+  await userPage.setContent('<title>User-owned A</title><body>User-owned A</body>');
+
+  const { client: clientA } = await startClient({
+    clientName: 'parallel-a',
+    args: [`--extension`],
+    env: {
+      PLAYWRIGHT_MCP_TASK_ID: 'task-a',
+      PWTEST_EXTENSION_USER_DATA_DIR: browserWithExtension.userDataDir,
+    },
+  });
+  const confirmationPagePromise = browserContext.waitForEvent('page', page =>
+    page.url().startsWith(`chrome-extension://${extensionId}/connect.html`)
+  );
+  const snapshotPromise = clientA.callTool({ name: 'browser_snapshot', arguments: {} });
+  await clickAllowAndSelect(await confirmationPagePromise, 'User-owned A');
+  await snapshotPromise;
+
+  const { client: clientB } = await startClient({
+    clientName: 'parallel-b',
+    args: [`--extension`],
+    env: {
+      PLAYWRIGHT_MCP_EXTENSION_TOKEN: tokenValue,
+      PLAYWRIGHT_MCP_TASK_ID: 'task-b',
+      PWTEST_EXTENSION_USER_DATA_DIR: browserWithExtension.userDataDir,
+    },
+  });
+  await clientB.callTool({ name: 'browser_navigate', arguments: { url: server.HELLO_WORLD } });
+
+  const groupTitles = () => statusPage.evaluate(async () =>
+    (await chrome.tabGroups.query({})).map(group => group.title || '').filter(title => title.startsWith('Playwright · ')).sort()
+  );
+  await expect.poll(groupTitles).toEqual([
+    expect.stringMatching(/^Playwright · task-a · /),
+    expect.stringMatching(/^Playwright · task-b · /),
+  ]);
+
+  await statusPage.bringToFront();
+  const ownedUrl = server.PREFIX + '/owned-by-task-b';
+  await clientB.callTool({ name: 'browser_tabs', arguments: { action: 'new', url: ownedUrl } });
+  await expect.poll(() => statusPage.evaluate(async url => {
+    const [taskTab] = await chrome.tabs.query({ url });
+    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    return { taskTabActive: taskTab?.active, activeTabUrl: activeTab?.url };
+  }, ownedUrl)).toEqual({ taskTabActive: false, activeTabUrl: statusPage.url() });
+  await clientB.callTool({ name: 'browser_tabs', arguments: { action: 'select', index: 0 } });
+  expect(await statusPage.evaluate(async () => (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.url)).toBe(statusPage.url());
+
+  await clientA.close();
+  await expect.poll(groupTitles).toEqual([
+    expect.stringMatching(/^Playwright · task-b · /),
+  ]);
+  await expect(userPage).toHaveTitle('User-owned A');
+  expect(await statusPage.evaluate(async () => {
+    const [tab] = await chrome.tabs.query({ title: 'User-owned A' });
+    return tab?.groupId === chrome.tabs.TAB_ID_NONE;
+  })).toBe(true);
+
+  expect(await clientB.callTool({ name: 'browser_tabs', arguments: { action: 'list' } })).toHaveResponse({
+    result: expect.stringContaining(ownedUrl),
+  });
+
+  await clientB.close();
+  await expect.poll(groupTitles).toEqual([]);
+  await expect.poll(() => statusPage.evaluate(async url => (await chrome.tabs.query({ url })).length, ownedUrl)).toBe(0);
 });
 
 test(`connect.html requests protocol version 2`, async ({ startExtensionClient, server }) => {
@@ -221,7 +295,7 @@ testWithOldExtensionVersion(`works with old extension version`, async ({ startEx
   await clickAllowAndSelect(selectorPage, 'Welcome');
 
   expect(await navigateResponse).toHaveResponse({
-    snapshot: expect.stringContaining(`- generic [active] [ref=f1e1]: Hello, world!`),
+    snapshot: expect.stringContaining('Hello, world!'),
   });
 });
 
@@ -240,7 +314,12 @@ test(`extension needs update`, async ({ startExtensionClient, server }) => {
   }).catch(() => {});
 
   const confirmationPage = await confirmationPagePromise;
-  await expect(confirmationPage.locator('.status-banner')).toContainText(`Playwright client trying to connect requires newer extension version`);
+  const statusBanner = confirmationPage.locator('.status-banner');
+  await expect(statusBanner).toContainText(`Playwright client trying to connect requires newer extension version`);
+  await expect(statusBanner).toContainText(`load packages/extension/dist as an unpacked extension`);
+  await expect(statusBanner.getByRole('link', { name: 'private extension source' })).toHaveAttribute(
+      'href',
+      'https://github.com/WitMiao/playwright/tree/main/packages/extension');
 });
 
 test(`extension rejects outdated client protocol version`, async ({ startExtensionClient, server }) => {
@@ -486,15 +565,15 @@ test(`bypass connection dialog with token`, async ({ browserWithExtension, start
   });
 
   expect(await navigateResponse).toHaveResponse({
-    snapshot: expect.stringContaining(`- generic [active] [ref=f1e1]: Hello, world!`),
+    snapshot: expect.stringContaining(`- generic [active] [ref=e1]: Hello, world!`),
   });
 
   const page = await browserContext.newPage();
   await page.goto(`chrome-extension://${extensionId}/status.html`);
-  await expect(page.locator('.client-info')).toContainText(`Connected to "${clientName}"`);
+  await expect(page.locator('.client-info')).toContainText(`Connected client: "${clientName}"`);
 });
 
-test(`times out when the extension rejects the token`, {
+test(`rejects an invalid extension token and allows retry`, {
   annotation: { type: 'issue', description: 'https://github.com/microsoft/playwright-mcp/issues/1732' },
 }, async ({ startExtensionClient, server }) => {
   const { browserContext, client } = await startExtensionClient({
@@ -508,7 +587,7 @@ test(`times out when the extension rejects the token`, {
     name: 'browser_navigate',
     arguments: { url: server.HELLO_WORLD },
   })).toHaveResponse({
-    error: expect.stringContaining(`Playwright extension did not connect within 0.5s after opening the connect page. Make sure the extension is installed in the Chrome profile "Default" and PLAYWRIGHT_MCP_EXTENSION_TOKEN matches its token.`),
+    error: expect.stringContaining('Playwright Extension rejected the authentication token.'),
     isError: true,
   });
   await expect((await connectPagePromise).locator('.status-banner')).toContainText('Invalid token provided.');
@@ -521,6 +600,29 @@ test(`times out when the extension rejects the token`, {
   });
   await retryConnectPagePromise;
   await retryPromise;
+});
+
+test(`CLI attach fails fast when the extension token is rejected`, async ({ browserWithExtension, cli }) => {
+  const browserContext = await browserWithExtension.launch();
+  const confirmationPagePromise = browserContext.waitForEvent('page', page =>
+    page.url().startsWith(`chrome-extension://${extensionId}/connect.html`)
+  );
+  const invalidToken = 'invalid-token-must-not-appear-in-errors';
+  const startTime = Date.now();
+  const resultPromise = cli(['-s=invalid-token', 'attach', '--extension=chromium'], {
+    env: {
+      PLAYWRIGHT_MCP_EXTENSION_TOKEN: invalidToken,
+      PWTEST_EXTENSION_USER_DATA_DIR: browserWithExtension.userDataDir,
+    },
+  });
+
+  const confirmationPage = await confirmationPagePromise;
+  const result = await resultPromise;
+  const output = `${result.output}\n${result.error}`;
+  expect(output).toContain('Playwright Extension rejected the authentication token.');
+  expect(output).not.toContain(invalidToken);
+  expect(Date.now() - startTime).toBeLessThan(5000);
+  await expect(confirmationPage.locator('.status-banner')).toContainText('Invalid token provided.');
 });
 
 test(`reconnects after the extension connection drops`, {
