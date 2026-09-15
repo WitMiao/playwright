@@ -16,30 +16,68 @@
 
 import { RelayConnection, debugLog } from './relayConnection';
 
-// Relay URLs recorded by `connectionRequested`, keyed by the connect page tab
-// id. The relay WebSocket opens lazily in `take` once the user clicks Allow.
+const kConnectionRejectedCloseCode = 4001;
+
+export type PendingConnection = {
+  connection: RelayConnection;
+  connectionId: string;
+  taskId: string;
+};
+
+type PendingConnectionRequest = Omit<PendingConnection, 'connection'> & {
+  mcpRelayUrl: string;
+};
+
+// Relay URLs recorded before a connection is opened, keyed either by the
+// connect page tab id (page flow) or the invite connection id (silent
+// discovery flow). The relay WebSocket opens lazily in `take` once the user
+// clicks Allow or the invite is accepted.
 export class PendingConnections {
-  private _map = new Map<number, string>();
+  private _map = new Map<string, PendingConnectionRequest>();
 
   constructor() {
-    chrome.tabs.onRemoved.addListener(tabId => this._map.delete(tabId));
+    // Page-flow requests die with their connect page tab. Keys from the
+    // invite flow are UUIDs, so they never collide with tab ids.
+    chrome.tabs.onRemoved.addListener(tabId => this._map.delete(String(tabId)));
   }
 
-  create(selectorTabId: number, mcpRelayUrl: string): void {
-    this._map.set(selectorTabId, mcpRelayUrl);
+  create(key: string, request: PendingConnectionRequest): void {
+    this._map.set(key, request);
   }
 
-  // A connect page awaiting approval; no connection may claim its tab.
-  has(selectorTabId: number): boolean {
-    return this._map.has(selectorTabId);
+  async reject(key: string, reason: string): Promise<void> {
+    const request = this._map.get(key);
+    if (!request)
+      return;
+    this._map.delete(key);
+    await rejectRelayConnection(request.mcpRelayUrl, reason);
   }
 
-  async take(selectorTabId: number): Promise<RelayConnection | undefined> {
-    const mcpRelayUrl = this._map.get(selectorTabId);
-    if (mcpRelayUrl === undefined)
+  async take(key: string): Promise<PendingConnection | undefined> {
+    const request = this._map.get(key);
+    if (!request)
       return undefined;
-    this._map.delete(selectorTabId);
-    return openRelayConnection(mcpRelayUrl);
+    this._map.delete(key);
+    return {
+      connection: await openRelayConnection(request.mcpRelayUrl),
+      connectionId: request.connectionId,
+      taskId: request.taskId,
+    };
+  }
+}
+
+async function rejectRelayConnection(mcpRelayUrl: string, reason: string): Promise<void> {
+  const socket = new WebSocket(mcpRelayUrl);
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      timeout = setTimeout(() => reject(new Error('Connection timeout')), 5000);
+      socket.onopen = () => socket.close(kConnectionRejectedCloseCode, reason);
+      socket.onerror = () => reject(new Error('WebSocket error'));
+      socket.onclose = () => resolve();
+    });
+  } finally {
+    clearTimeout(timeout);
   }
 }
 

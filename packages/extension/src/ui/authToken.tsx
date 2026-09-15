@@ -14,19 +14,31 @@
  * limitations under the License.
  */
 
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
+import { AUTH_TOKEN_STORAGE_KEY, generateAuthToken, getOrCreateAuthToken } from '../authToken';
 import { CopyToClipboard } from './copyToClipboard';
 import * as icons from './icons';
 import './authToken.css';
 
+export { generateAuthToken, getOrCreateAuthToken };
+
 export const AuthTokenSection: React.FC<{}> = ({}) => {
-  const [authToken, setAuthToken] = useState<string>(getOrCreateAuthToken);
+  const [authToken, setAuthToken] = useState<string>('');
+
+  useEffect(() => {
+    void getOrCreateAuthToken().then(setAuthToken);
+  }, []);
 
   const onRegenerateToken = useCallback(() => {
     const newToken = generateAuthToken();
-    localStorage.setItem('auth-token', newToken);
+    void chrome.storage.local.set({ [AUTH_TOKEN_STORAGE_KEY]: newToken });
     setAuthToken(newToken);
   }, []);
+
+  // The token loads asynchronously from chrome.storage; render nothing until
+  // it is ready so readers (and tests) never observe an empty token.
+  if (!authToken)
+    return null;
 
   return (
     <div className='auth-token-section'>
@@ -45,28 +57,3 @@ export const AuthTokenSection: React.FC<{}> = ({}) => {
 function authTokenCode(authToken: string) {
   return `PLAYWRIGHT_MCP_EXTENSION_TOKEN=${authToken}`;
 }
-
-function generateAuthToken(): string {
-  // Generate a cryptographically secure random token
-  const array = new Uint8Array(32);
-  crypto.getRandomValues(array);
-  // Convert to base64 and make it URL-safe
-  return btoa(String.fromCharCode.apply(null, Array.from(array)))
-      .replace(/[+/=]/g, match => {
-        switch (match) {
-          case '+': return '-';
-          case '/': return '_';
-          case '=': return '';
-          default: return match;
-        }
-      });
-}
-
-export const getOrCreateAuthToken = (): string => {
-  let token = localStorage.getItem('auth-token');
-  if (!token) {
-    token = generateAuthToken();
-    localStorage.setItem('auth-token', token);
-  }
-  return token;
-};
