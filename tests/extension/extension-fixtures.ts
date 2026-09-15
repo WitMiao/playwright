@@ -68,8 +68,10 @@ export const test = base.extend<TestFixtures>({
       launch: async (mode?: 'disable-extension') => {
         browserContext = await chromium.launchPersistentContext(userDataDir, {
           channel: mcpBrowser,
-          // Opening the browser singleton only works in headed.
-          headless: false,
+          // Headless by default so test runs don't steal the user's screen
+          // focus; new headless supports --load-extension. Set
+          // PWTEST_EXTENSION_HEADED=1 to watch the browser.
+          headless: !process.env.PWTEST_EXTENSION_HEADED,
           // Automation disables singleton browser process behavior, which is necessary for the extension.
           ignoreDefaultArgs: ['--enable-automation'],
           args: mode === 'disable-extension' ? [] : [
