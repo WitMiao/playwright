@@ -20,10 +20,11 @@
  * Endpoints:
  * - /cdp/guid - Full CDP interface for Playwright MCP
  * - /extension/guid - Extension connection
- * - /invites - Discovery endpoint: the extension's background service worker
- *   scans a fixed port range on 127.0.0.1 for pending connection invites, so
- *   no URL has to be passed on the Chrome command line (that would open a
- *   foreground tab and steal focus from the user).
+ * - /invites - Discovery endpoint (HTTP GET, polled): the extension's
+ *   background service worker scans a fixed port range on 127.0.0.1 for
+ *   pending connection invites, so no URL has to be passed on the Chrome
+ *   command line (that would open a foreground tab and steal focus from the
+ *   user).
  *
  * The protocol version advertised to the extension can be overridden with the
  * PWTEST_EXTENSION_PROTOCOL env variable, and the connection timeout with
@@ -164,6 +165,10 @@ export class CDPRelayServer {
     void this._extensionConnectionPromise.catch(logUnhandledError);
     this._wsServer = new WSServer({
       onRequest: (request, response) => {
+        if (new URL('http://localhost' + (request.url || '')).pathname === extensionInvitesPathname) {
+          this._handleInviteRequest(request, response);
+          return;
+        }
         response.statusCode = 404;
         response.end();
       },
@@ -322,23 +327,38 @@ export class CDPRelayServer {
     this._extensionConnectionPromise.resolve();
   }
 
-  // Discovery: the extension's background service worker connects to /invites
-  // while scanning the fixed port range. The invite stays available until the
+  // Discovery over HTTP: the extension's background service worker polls GET
+  // /invites while scanning the fixed port range. A plain GET is used instead
+  // of a WebSocket probe because a refused fetch() merely rejects the promise,
+  // while every refused WebSocket is reported by the network stack as a
+  // console error — 32 closed ports per sweep would flood the extension's
+  // error page on an idle machine. The invite stays available until the
   // extension claims it by connecting to /extension/<connectionId> (a token
-  // rejection claims it too), so repeated scans and several browser profiles
+  // rejection claims it too), so repeated polls and several browser profiles
   // can safely re-read it. The invite carries the token and the extension
   // verifies it against its own stored token — exactly like the connect page
   // did — so a mismatched token still produces the fast, actionable
   // "rejected the authentication token" error instead of a silent timeout.
-  private _handleInviteConnection(request: http.IncomingMessage, ws: WebSocket): void {
-    if (request.headers.origin !== `chrome-extension://${playwrightExtensionId}`) {
-      ws.close(1000, 'Unexpected origin');
+  private _handleInviteRequest(request: http.IncomingMessage, response: http.ServerResponse): void {
+    const origin = request.headers.origin;
+    // Browsers attach the chrome-extension:// origin; a missing Origin (e.g.
+    // curl) is accepted — loopback-only exposure is the same surface the
+    // WebSocket handshake had — but a known foreign origin is rejected.
+    if (origin && origin !== `chrome-extension://${playwrightExtensionId}`) {
+      response.statusCode = 403;
+      response.end();
       return;
     }
     if (this._extensionConnection) {
-      ws.close(1000, 'Invite already claimed');
+      response.statusCode = 409;
+      response.end();
       return;
     }
+    response.setHeader('Content-Type', 'application/json');
+    response.end(JSON.stringify(this._invite()));
+  }
+
+  private _invite(): protocol.ExtensionInvite {
     const invite: protocol.ExtensionInvite = {
       type: 'invite',
       extensionUrl: `${this._wsHost}${this._extensionPath}`,
@@ -349,7 +369,22 @@ export class CDPRelayServer {
     };
     if (this._token)
       invite.token = this._token;
-    ws.send(JSON.stringify(invite));
+    return invite;
+  }
+
+  // Legacy WebSocket variant of the discovery endpoint, kept so an older
+  // extension still pairs with a newer playwright-core. The current extension
+  // polls GET /invites instead — see _handleInviteRequest.
+  private _handleInviteConnection(request: http.IncomingMessage, ws: WebSocket): void {
+    if (request.headers.origin !== `chrome-extension://${playwrightExtensionId}`) {
+      ws.close(1000, 'Unexpected origin');
+      return;
+    }
+    if (this._extensionConnection) {
+      ws.close(1000, 'Invite already claimed');
+      return;
+    }
+    ws.send(JSON.stringify(this._invite()));
   }
 
   private async _handlePlaywrightMessage(message: CDPCommand): Promise<void> {

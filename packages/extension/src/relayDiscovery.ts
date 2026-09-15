@@ -107,62 +107,28 @@ async function discoverInvites(): Promise<RelayInvite[]> {
 }
 
 async function probePort(port: number): Promise<RelayInvite | undefined> {
-  let socket: WebSocket | undefined;
   try {
-    const result = await Promise.race([
-      requestInvite(port, s => socket = s),
-      new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), SCAN_BUDGET_MS)),
-    ]);
-    return result;
-  } catch {
-    return undefined;
-  } finally {
-    // A probe that timed out may still have a live socket — close it so slow
-    // scans don't leak connections.
-    try {
-      socket?.close();
-    } catch {
-      // Already closed.
+    // Probe with a plain GET rather than a WebSocket: a refused fetch merely
+    // rejects the promise, while every refused WebSocket is reported by the
+    // network stack as a console error — with 32 closed ports per sweep the
+    // extension error page would fill within seconds on an idle machine.
+    const response = await fetch(`http://127.0.0.1:${port}/invites`, {
+      signal: AbortSignal.timeout(SCAN_BUDGET_MS),
+    });
+    if (!response.ok)
+      return undefined;
+    const invite = await response.json() as RelayInvite;
+    if (invite?.type !== 'invite' || !isLoopbackWsUrl(invite.extensionUrl)) {
+      swlog(`invite rejected ${port}: type=${invite?.type} url=${invite?.extensionUrl}`);
+      return undefined;
     }
+    swlog(`invite accepted ${port}: ${invite.connectionId}`);
+    return invite;
+  } catch {
+    // Refused (the usual idle case, nothing to discover on this port) or
+    // timed out.
+    return undefined;
   }
-}
-
-function requestInvite(port: number, onSocket: (socket: WebSocket) => void): Promise<RelayInvite | undefined> {
-  return new Promise(resolve => {
-    let settled = false;
-    const done = (invite: RelayInvite | undefined) => {
-      if (settled)
-        return;
-      settled = true;
-      try {
-        socket.close();
-      } catch {
-        // Already closed.
-      }
-      resolve(invite);
-    };
-    const socket = new WebSocket(`ws://127.0.0.1:${port}/invites`);
-    onSocket(socket);
-    socket.onmessage = event => {
-      swlog(`invite frame ${port}`);
-      try {
-        const invite = JSON.parse(String(event.data)) as RelayInvite;
-        if (invite?.type !== 'invite' || !isLoopbackWsUrl(invite.extensionUrl)) {
-          swlog(`invite rejected ${port}: type=${invite?.type} url=${invite?.extensionUrl}`);
-          return done(undefined);
-        }
-        swlog(`invite accepted ${port}: ${invite.connectionId}`);
-        done(invite);
-      } catch (error: any) {
-        swlog(`invite parse error ${port}: ${error?.message}`);
-        done(undefined);
-      }
-    };
-    // Both a 4001 token rejection and a plain close mean: nothing to fetch
-    // on this port.
-    socket.onclose = () => done(undefined);
-    socket.onerror = () => done(undefined);
-  });
 }
 
 function isLoopbackWsUrl(value: string): boolean {
