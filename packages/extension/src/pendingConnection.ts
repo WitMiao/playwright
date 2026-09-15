@@ -28,32 +28,36 @@ type PendingConnectionRequest = Omit<PendingConnection, 'connection'> & {
   mcpRelayUrl: string;
 };
 
-// Relay URLs recorded by `connectionRequested`, keyed by the connect page tab
-// id. The relay WebSocket opens lazily in `take` once the user clicks Allow.
+// Relay URLs recorded before a connection is opened, keyed either by the
+// connect page tab id (page flow) or the invite connection id (silent
+// discovery flow). The relay WebSocket opens lazily in `take` once the user
+// clicks Allow or the invite is accepted.
 export class PendingConnections {
-  private _map = new Map<number, PendingConnectionRequest>();
+  private _map = new Map<string, PendingConnectionRequest>();
 
   constructor() {
-    chrome.tabs.onRemoved.addListener(tabId => this._map.delete(tabId));
+    // Page-flow requests die with their connect page tab. Keys from the
+    // invite flow are UUIDs, so they never collide with tab ids.
+    chrome.tabs.onRemoved.addListener(tabId => this._map.delete(String(tabId)));
   }
 
-  create(selectorTabId: number, request: PendingConnectionRequest): void {
-    this._map.set(selectorTabId, request);
+  create(key: string, request: PendingConnectionRequest): void {
+    this._map.set(key, request);
   }
 
-  async reject(selectorTabId: number, reason: string): Promise<void> {
-    const request = this._map.get(selectorTabId);
+  async reject(key: string, reason: string): Promise<void> {
+    const request = this._map.get(key);
     if (!request)
       return;
-    this._map.delete(selectorTabId);
+    this._map.delete(key);
     await rejectRelayConnection(request.mcpRelayUrl, reason);
   }
 
-  async take(selectorTabId: number): Promise<PendingConnection | undefined> {
-    const request = this._map.get(selectorTabId);
+  async take(key: string): Promise<PendingConnection | undefined> {
+    const request = this._map.get(key);
     if (!request)
       return undefined;
-    this._map.delete(selectorTabId);
+    this._map.delete(key);
     return {
       connection: await openRelayConnection(request.mcpRelayUrl),
       connectionId: request.connectionId,

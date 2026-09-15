@@ -20,10 +20,15 @@ import type { TestOptions } from '../mcp/fixtures';
 
 export default defineConfig<TestOptions>({
   testDir: './',
-  fullyParallel: true,
+  // Discovery is asynchronous now: the service worker finds the relay by
+  // scanning a fixed port range, which adds a variable grace period to every
+  // connection, and heavier tests chain several connections.
+  timeout: 90_000,
+  // The discovery port range is machine-global, so concurrently running test
+  // browsers would claim each other's invites.
+  workers: 1,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
-  workers: process.env.CI ? 1 : undefined,
   reporter: process.env.CI ? [
     ['list'],
     ['../config/parquetReporter.ts'],

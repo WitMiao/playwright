@@ -14,10 +14,18 @@
  * limitations under the License.
  */
 
+import { getOrCreateAuthToken } from './authToken';
 import { RelayConnection, debugLog } from './relayConnection';
 import { PendingConnections } from './pendingConnection';
 import { ConnectedTabGroup, isNonDebuggableUrl } from './connectedTabGroup';
+import { startRelayDiscovery, RelayInvite } from './relayDiscovery';
+import { swlog } from './swDebugLog';
 import { cleanupStalePlaywrightGroups } from './taskResources';
+
+// Keep in sync with protocol.VERSION in
+// packages/playwright-core/src/tools/mcp/protocol.ts. The connect page
+// declares the same value (SUPPORTED_PROTOCOL_VERSION there).
+const SUPPORTED_PROTOCOL_VERSION = 2;
 
 type PageMessage = {
   type: 'connectionRequested';
@@ -43,6 +51,24 @@ type PageMessage = {
   type: 'keepalive';
 };
 
+// Auth token cache + hang guard: a stuck chrome.storage read must never stall
+// invite handling. On a timeout the invite falls back to the approval page,
+// whose page context re-reads the token itself.
+let cachedAuthToken: string | undefined;
+
+async function readAuthTokenWithTimeout(): Promise<string | undefined> {
+  if (cachedAuthToken !== undefined)
+    return cachedAuthToken;
+  const token = await Promise.race([
+    getOrCreateAuthToken().then(token => {
+      cachedAuthToken = token;
+      return token;
+    }),
+    new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), 3000)),
+  ]);
+  return token;
+}
+
 class PlaywrightExtension {
   private _activeConnections = new Map<string, {
     group: ConnectedTabGroup;
@@ -54,6 +80,10 @@ class PlaywrightExtension {
   // transfer ownership to the active ConnectedTabGroup without an await gap.
   private _reservedTabIds = new Set<number>();
   private _pendingConnections = new PendingConnections();
+  // Invites already acted upon. The relay hands the same invite to every
+  // discovery probe until it is claimed, so repeated scans must not start a
+  // task twice.
+  private _handledConnectionIds = new Set<string>();
   // Service worker restarts lose all connection state, so any existing
   // Playwright groups are stale. Connections wait on this before reconciling.
   private _cleanupPromise: Promise<void>;
@@ -62,6 +92,7 @@ class PlaywrightExtension {
     chrome.runtime.onMessage.addListener(this._onMessage.bind(this));
     chrome.action.onClicked.addListener(this._onActionClicked.bind(this));
     this._cleanupPromise = cleanupStalePlaywrightGroups();
+    startRelayDiscovery(invite => this._handleInvite(invite).catch(error => debugLog('Failed to handle relay invite:', error?.message)));
   }
 
   // Promise-based message handling is not supported in Chrome: https://issues.chromium.org/issues/40753031
@@ -70,7 +101,7 @@ class PlaywrightExtension {
       case 'connectionRequested': {
         const selectorTabId = sender.tab!.id!;
         this._releaseConnectPage(selectorTabId).then(() => {
-          this._pendingConnections.create(selectorTabId, {
+          this._pendingConnections.create(String(selectorTabId), {
             mcpRelayUrl: message.mcpRelayUrl,
             connectionId: message.connectionId || crypto.randomUUID(),
             taskId: message.taskId || 'Playwright',
@@ -85,7 +116,13 @@ class PlaywrightExtension {
             (error: any) => sendResponse({ success: false, error: error.message }));
         return true;
       case 'connectToTab': {
-        this._connectTab(sender.tab!.id!, sender.tab!.windowId, message.tab, message.clientName).then(
+        this._connectTask({
+          pendingKey: String(sender.tab!.id!),
+          selectorTabId: sender.tab!.id!,
+          selectorWindowId: sender.tab!.windowId,
+          tab: message.tab,
+          clientName: message.clientName,
+        }).then(
             () => sendResponse({ success: true }),
             (error: any) => sendResponse({ success: false, error: error.message }));
         return true; // Return true to indicate that the response will be sent asynchronously
@@ -101,7 +138,7 @@ class PlaywrightExtension {
         });
         return false;
       case 'rejectConnection':
-        this._pendingConnections.reject(sender.tab!.id!, 'Playwright Extension rejected the authentication token.').then(
+        this._pendingConnections.reject(String(sender.tab!.id!), 'Playwright Extension rejected the authentication token.').then(
             () => sendResponse({ success: true }),
             (error: any) => sendResponse({ success: false, error: error.message }));
         return true;
@@ -120,52 +157,121 @@ class PlaywrightExtension {
     }
   }
 
-  private async _connectTab(selectorTabId: number, selectorWindowId: number, tab: chrome.tabs.Tab | undefined, clientName: string | undefined): Promise<void> {
+  // A relay invite discovered by startRelayDiscovery. Token-matched invites
+  // are accepted silently — no connect page, no tab activation, nothing the
+  // user can feel. Anything else (first-time consent, unknown or mismatched
+  // token, protocol mismatch) opens the connect page in the background and
+  // lets the existing page flow drive the decision.
+  private async _handleInvite(invite: RelayInvite): Promise<void> {
+    swlog(`handleInvite ${invite.connectionId} token=${invite.token !== undefined}`);
+    if (this._handledConnectionIds.has(invite.connectionId) || this._activeConnections.has(invite.connectionId))
+      return;
+    this._handledConnectionIds.add(invite.connectionId);
+    if (invite.protocolVersion !== SUPPORTED_PROTOCOL_VERSION || invite.token === undefined || invite.token !== await readAuthTokenWithTimeout()) {
+      swlog(`invite ${invite.connectionId} -> approval page`);
+      await this._openApprovalPage(invite);
+      return;
+    }
+    swlog(`invite ${invite.connectionId} -> silent accept`);
+    debugLog(`Accepting relay invite for "${invite.client?.name ?? 'unknown'}" (task ${invite.taskId})`);
+    this._pendingConnections.create(invite.connectionId, {
+      mcpRelayUrl: invite.extensionUrl,
+      connectionId: invite.connectionId,
+      taskId: invite.taskId || 'Playwright',
+    });
+    try {
+      await this._connectTask({ pendingKey: invite.connectionId, clientName: invite.client?.name });
+    } catch (error: any) {
+      debugLog('Failed to accept relay invite:', error.message);
+    }
+  }
+
+  // Opens the connect page for invites that cannot be accepted silently.
+  // It opens in the background: the user decides when to look at it, and the
+  // page flow (connectionRequested / connectToTab / rejectConnection) takes
+  // over from there.
+  private async _openApprovalPage(invite: RelayInvite): Promise<void> {
+    const url = new URL(chrome.runtime.getURL('connect.html'));
+    url.searchParams.set('mcpRelayUrl', invite.extensionUrl);
+    url.searchParams.set('taskId', invite.taskId);
+    url.searchParams.set('connectionId', invite.connectionId);
+    url.searchParams.set('client', JSON.stringify(invite.client ?? {}));
+    url.searchParams.set('protocolVersion', String(invite.protocolVersion));
+    if (invite.token !== undefined)
+      url.searchParams.set('token', invite.token);
+    const windowId = await this._chooseTargetWindow();
+    if (windowId !== undefined)
+      await chrome.tabs.create({ url: url.toString(), active: false, windowId });
+    else
+      await chrome.windows.create({ url: url.toString(), focused: false });
+  }
+
+  private async _connectTask(params: {
+    pendingKey: string;
+    // Picked in the connect page ("Allow & select"); absent on background
+    // paths where a fresh task tab is created instead.
+    tab?: chrome.tabs.Tab;
+    clientName?: string;
+    // Present on the connect page flow, where the page tab is closed once the
+    // connection is established.
+    selectorTabId?: number;
+    selectorWindowId?: number;
+  }): Promise<void> {
     let reservedTabId: number | undefined;
     let acceptedConnection: RelayConnection | undefined;
     try {
       await this._cleanupPromise;
-      let selectedTab = tab;
-      if (tab?.id !== undefined) {
+      let selectedTab = params.tab;
+      if (selectedTab?.id !== undefined) {
         const conflictMessage = 'Tab is already connected to another Playwright client.';
-        if (this._claimedTabIds().has(tab.id)) {
-          await this._pendingConnections.reject(selectorTabId, conflictMessage).catch(error => {
+        if (this._claimedTabIds().has(selectedTab.id)) {
+          await this._pendingConnections.reject(params.pendingKey, conflictMessage).catch(error => {
             debugLog('Failed to reject duplicate tab connection:', error);
           });
           throw new Error(conflictMessage);
         }
-        reservedTabId = tab.id;
-        this._reservedTabIds.add(tab.id);
-        selectedTab = await chrome.tabs.get(tab.id);
+        reservedTabId = selectedTab.id;
+        this._reservedTabIds.add(selectedTab.id);
+        selectedTab = await chrome.tabs.get(selectedTab.id);
       }
 
-      const pending = await this._pendingConnections.take(selectorTabId);
+      const pending = await this._pendingConnections.take(params.pendingKey);
       if (!pending)
         throw new Error('Pending client connection closed');
       acceptedConnection = pending.connection;
       if (this._activeConnections.has(pending.connectionId))
         throw new Error('Connection id is already active');
-      selectedTab ??= await chrome.tabs.create({
-        url: 'about:blank',
-        active: false,
-        index: 0,
-        windowId: selectorWindowId,
-      });
-      if (selectedTab.id === undefined)
+      if (!selectedTab) {
+        const windowId = params.selectorWindowId ?? await this._chooseTargetWindow();
+        if (windowId !== undefined) {
+          selectedTab = await chrome.tabs.create({
+            url: 'about:blank',
+            active: false,
+            index: 0,
+            windowId,
+          });
+        } else {
+          // No browser window at all: create a background one so the task tab
+          // has somewhere to live without stealing focus.
+          const win = await chrome.windows.create({ url: 'about:blank', focused: false });
+          selectedTab = win?.tabs?.[0];
+        }
+      }
+      if (selectedTab?.id === undefined)
         throw new Error('Failed to create a background task tab');
 
-      const group = new ConnectedTabGroup(
+      const group: ConnectedTabGroup = new ConnectedTabGroup(
           pending.connection,
           selectedTab,
           pending.connectionId,
           pending.taskId,
-          !tab,
+          !params.tab,
           tabId => this._isTabClaimedByOtherTask(tabId, group));
       group.onclose = () => {
         if (this._activeConnections.get(pending.connectionId)?.group === group)
           this._activeConnections.delete(pending.connectionId);
       };
-      this._activeConnections.set(pending.connectionId, { group, clientName, taskId: pending.taskId });
+      this._activeConnections.set(pending.connectionId, { group, clientName: params.clientName, taskId: pending.taskId });
       acceptedConnection = undefined;
       if (reservedTabId !== undefined) {
         this._reservedTabIds.delete(reservedTabId);
@@ -175,24 +281,32 @@ class PlaywrightExtension {
       // Activating a target is reserved for the user's explicit
       // "Allow & select" click. Background/token authorization never enters
       // this branch and never changes the active tab.
-      if (tab) {
+      if (params.tab) {
         await Promise.all([
           chrome.tabs.update(selectedTab.id, { active: true }),
           chrome.windows.update(selectedTab.windowId, { focused: true }),
         ]).catch(() => {});
       }
-      if (selectedTab.id !== selectorTabId)
-        await chrome.tabs.remove(selectorTabId).catch(() => {});
+      if (params.selectorTabId !== undefined && selectedTab.id !== params.selectorTabId)
+        await chrome.tabs.remove(params.selectorTabId).catch(() => {});
     } catch (error: any) {
       acceptedConnection?.close(error.message);
       if (reservedTabId !== undefined)
         this._reservedTabIds.delete(reservedTabId);
-      await this._pendingConnections.reject(selectorTabId, error.message).catch(rejectionError => {
+      await this._pendingConnections.reject(params.pendingKey, error.message).catch(rejectionError => {
         debugLog('Failed to reject pending connection:', rejectionError);
       });
       debugLog(`Failed to connect task tab:`, error.message);
       throw error;
     }
+  }
+
+  // The user's current normal window, so agent tabs and the approval page
+  // land where the user is without activating anything.
+  private async _chooseTargetWindow(): Promise<number | undefined> {
+    const windows = await chrome.windows.getAll({ windowTypes: ['normal'] });
+    const withId = windows.filter(win => win.id !== undefined);
+    return withId.find(win => win.focused)?.id ?? withId[0]?.id;
   }
 
   // Chrome can inherit the active tab group when opening the connect page.

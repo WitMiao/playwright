@@ -215,7 +215,7 @@ export async function connectWithToken(browserContext: BrowserContext, startClie
       PWTEST_EXTENSION_USER_DATA_DIR: userDataDir,
     },
   });
-  return { client, stderr };
+  return { client: wrapClientWithSWLogDump(browserContext, client), stderr };
 }
 
 // The connect page closes itself once a different tab is selected, which races
@@ -241,7 +241,41 @@ export async function connectAndNavigate(
     page.url().startsWith(`chrome-extension://${extensionId}/connect.html`)
   );
   const navigatePromise = client.callTool({ name: 'browser_navigate', arguments: { url } });
-  const selectorPage = await confirmationPagePromise;
-  await clickAllowAndSelect(selectorPage, 'Welcome');
-  return await navigatePromise;
+  try {
+    const selectorPage = await confirmationPagePromise;
+    await clickAllowAndSelect(selectorPage, 'Welcome');
+    return await navigatePromise;
+  } catch (error) {
+    await dumpServiceWorkerLog(browserContext);
+    throw error;
+  }
+}
+
+// Dumps the extension service worker's debug ring buffer to the test output,
+// to diagnose stuck discovery flows.
+export async function dumpServiceWorkerLog(browserContext: BrowserContext): Promise<void> {
+  try {
+    const [sw] = browserContext.serviceWorkers();
+    if (!sw)
+      return;
+    const log = await sw.evaluate(() => (globalThis as any).__pwSwLog ?? []);
+    console.log('=== SW LOG ===\n' + JSON.stringify(log, null, 1));
+  } catch {
+    // The worker may be gone already.
+  }
+}
+
+// The extension browser connects lazily on the first tool call; wrap callTool
+// so a stuck discovery flow dumps the service worker debug log.
+export function wrapClientWithSWLogDump(browserContext: BrowserContext, client: Client): Client {
+  const original = client.callTool.bind(client);
+  (client as any).callTool = async (...args: any[]) => {
+    try {
+      return await (original as any)(...args);
+    } catch (error) {
+      await dumpServiceWorkerLog(browserContext);
+      throw error;
+    }
+  };
+  return client;
 }

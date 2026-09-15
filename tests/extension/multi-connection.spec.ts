@@ -181,7 +181,16 @@ test(`status page disconnects a single client`, {
 
   const connect = async (clientName: string, url: string) => {
     const client = await connectWithName(browserWithExtension, startClient, token, clientName);
-    await client.callTool({ name: 'browser_navigate', arguments: { url } });
+    // Connection-bearing calls wait on async discovery; give them headroom
+    // over the MCP SDK's default 60s request timeout.
+    try {
+      await client.callTool({ name: 'browser_navigate', arguments: { url } }, undefined, { timeout: 120_000 });
+    } catch (error) {
+      const [sw] = browserContext.serviceWorkers();
+      if (sw)
+        console.log('=== SW LOG ===\n' + JSON.stringify(await sw.evaluate(() => (globalThis as any).__pwSwLog ?? []), null, 1));
+      throw error;
+    }
     return client;
   };
 

@@ -107,7 +107,7 @@ const ConnectApp: React.FC = () => {
         ...connectionInfo,
       });
 
-      const expectedToken = getOrCreateAuthToken();
+      const expectedToken = await getOrCreateAuthToken();
       const token = params.get('token');
       if (token === expectedToken) {
         await handleConnectToTab();

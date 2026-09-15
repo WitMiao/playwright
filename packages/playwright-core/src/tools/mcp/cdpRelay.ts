@@ -20,6 +20,10 @@
  * Endpoints:
  * - /cdp/guid - Full CDP interface for Playwright MCP
  * - /extension/guid - Extension connection
+ * - /invites - Discovery endpoint: the extension's background service worker
+ *   scans a fixed port range on 127.0.0.1 for pending connection invites, so
+ *   no URL has to be passed on the Chrome command line (that would open a
+ *   foreground tab and steal focus from the user).
  *
  * The protocol version advertised to the extension can be overridden with the
  * PWTEST_EXTENSION_PROTOCOL env variable, and the connection timeout with
@@ -28,6 +32,7 @@
 
 import { spawn } from 'child_process';
 import os from 'os';
+import path from 'path';
 
 import debug from 'debug';
 import ws from 'ws';
@@ -43,6 +48,7 @@ import { ExtensionProtocolV2 } from './cdpRelayV2';
 import * as protocol from './protocol';
 
 import type websocket from 'ws';
+import type http from 'http';
 import type { ExtensionCommandV2, ExtensionEventsV2 } from './protocol';
 import type { CDPMessage } from './browserModel';
 import type { WebSocket } from 'ws';
@@ -50,7 +56,62 @@ import type { WebSocket } from 'ws';
 
 const debugLogger = debug('pw:mcp:relay');
 
-const extensionConnectionTimeout = +(process.env.PWTEST_EXTENSION_CONNECT_TIMEOUT ?? 30_000);
+async function listenOnFreePort(wsServer: WSServer, portBase: number, portCount: number): Promise<string> {
+  let lastError: Error | undefined;
+  for (let port = portBase; port < portBase + portCount; port++) {
+    try {
+      return await wsServer.listen(port, '127.0.0.1', '');
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw new Error(`No free port for the extension relay in range ${portBase}..${portBase + portCount - 1}: ${lastError?.message}`);
+}
+
+// Whether a browser with this executable name is already running. Used to
+// avoid spawning the browser a second time: launching it while it runs would
+// open a new window and steal focus.
+async function isBrowserProcessRunning(processName: string): Promise<boolean> {
+  try {
+    if (os.platform() === 'win32') {
+      const output = await execFileOutput('tasklist', ['/NH', '/FO', 'CSV', '/FI', `IMAGENAME eq ${processName}`]);
+      return output.toLowerCase().includes(processName.toLowerCase());
+    }
+    // pgrep -f matches the full command line: stable Chrome on macOS ships as
+    // ".../Google Chrome.app/Contents/MacOS/Google Chrome", so a plain -x name
+    // match would miss it.
+    await execFileOutput('pgrep', ['-f', processName]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function execFileOutput(file: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(file, args, { stdio: ['ignore', 'pipe', 'ignore'] });
+    let output = '';
+    child.stdout?.on('data', data => output += data.toString());
+    child.on('error', reject);
+    child.on('close', code => {
+      if (code === 0)
+        resolve(output);
+      else
+        reject(new Error(`"${file}" exited with code ${code}`));
+    });
+  });
+}
+
+const extensionConnectionTimeout = +(process.env.PWTEST_EXTENSION_CONNECT_TIMEOUT ?? 90_000);
+
+// The extension's background service worker discovers the relay by scanning
+// this fixed port range on 127.0.0.1 (see
+// packages/extension/src/relayDiscovery.ts — keep the two in sync). The range
+// is deliberately not configurable: the extension cannot read process env, so
+// both sides must agree on it in code.
+const extensionInvitePortBase = 7317;
+const extensionInvitePortCount = 32;
+const extensionInvitesPathname = '/invites';
 
 type CDPCommand = {
   id: number;
@@ -76,6 +137,7 @@ export class CDPRelayServer {
   private _extensionConnection: ExtensionConnection | null = null;
   private _protocolVersion: number;
   private _token?: string;
+  private _clientName = 'Playwright MCP';
   private _handler: ExtensionProtocolV2;
   private _extensionConnectionPromise = new ManualPromise<void>();
 
@@ -107,11 +169,13 @@ export class CDPRelayServer {
       },
       onHeaders: () => {},
       onUpgrade: () => undefined,
-      isAllowedPathname: pathname => pathname === this._cdpPath || pathname === this._extensionPath,
+      isAllowedPathname: pathname => pathname === this._cdpPath || pathname === this._extensionPath || pathname === extensionInvitesPathname,
       onConnection: (request, url, ws) => {
         debugLogger(`New connection to ${url.pathname}`);
         if (url.pathname === this._cdpPath)
           this._handlePlaywrightConnection(ws);
+        else if (url.pathname === extensionInvitesPathname)
+          this._handleInviteConnection(request, ws);
         else
           this._handleExtensionConnection(ws);
         return undefined;
@@ -120,7 +184,10 @@ export class CDPRelayServer {
   }
 
   async start(): Promise<void> {
-    this._wsHost = await this._wsServer.listen(0, undefined, '');
+    // Bind to the explicit loopback address so the extension's discovery scan
+    // (127.0.0.1) always matches the advertised endpoint, regardless of how
+    // the resolver treats 'localhost' (#40605).
+    this._wsHost = await listenOnFreePort(this._wsServer, extensionInvitePortBase, extensionInvitePortCount);
   }
 
   cdpEndpoint() {
@@ -133,8 +200,9 @@ export class CDPRelayServer {
 
   async establishExtensionConnection(clientName: string) {
     debugLogger('Establishing extension connection');
-    await this._openConnectPageInBrowser(clientName);
-    debugLogger('Waiting for incoming extension connection');
+    this._clientName = clientName;
+    await this._launchBrowserIfNeeded();
+    debugLogger('Waiting for the extension to discover the relay');
     // Without a token the user has to approve the connection in the browser, which can take arbitrarily long.
     const deadline = this._token ? monotonicTime() + extensionConnectionTimeout : 0;
     const { timedOut } = await raceAgainstDeadline(async () => {
@@ -143,28 +211,16 @@ export class CDPRelayServer {
     }, deadline);
     if (timedOut) {
       const profile = this._profileDirectory ? ` "${this._profileDirectory}"` : '';
-      throw new Error(`Playwright extension did not connect within ${extensionConnectionTimeout / 1000}s after opening the connect page. Make sure the extension is installed in the Chrome profile${profile} and PLAYWRIGHT_MCP_EXTENSION_TOKEN matches its token.`);
+      throw new Error(`Playwright extension did not connect within ${extensionConnectionTimeout / 1000}s. Make sure the browser is running with the extension installed in the Chrome profile${profile} and PLAYWRIGHT_MCP_EXTENSION_TOKEN matches its token.`);
     }
     debugLogger('Extension connection established');
   }
 
-  private async _openConnectPageInBrowser(clientName: string) {
-    const mcpRelayEndpoint = `${this._wsHost}${this._extensionPath}`;
-    const url = new URL(`chrome-extension://${playwrightExtensionId}/connect.html`);
-    url.searchParams.set('mcpRelayUrl', mcpRelayEndpoint);
-    url.searchParams.set('taskId', this._taskId);
-    url.searchParams.set('connectionId', this._connectionId);
-    const client = {
-      name: clientName,
-      // Not used anymore.
-      version: undefined,
-    };
-    url.searchParams.set('client', JSON.stringify(client));
-    url.searchParams.set('protocolVersion', this._protocolVersion.toString());
-    if (this._token)
-      url.searchParams.set('token', this._token);
-    const href = url.toString();
-
+  // Launches the browser when it is not running yet. The extension discovers
+  // the relay through the /invites endpoint, so no URL is passed on the
+  // command line — a command-line URL would open a foreground tab and steal
+  // focus from whatever the user is doing.
+  private async _launchBrowserIfNeeded() {
     const channel = registry.isChromiumAlias(this._browserChannel) ? 'chromium' : this._browserChannel;
     let executablePath = this._executablePath;
     if (!executablePath) {
@@ -176,6 +232,11 @@ export class CDPRelayServer {
         throw new Error(`"${this._browserChannel}" executable not found. Make sure it is installed at a standard location.`);
     }
 
+    if (await isBrowserProcessRunning(path.basename(executablePath))) {
+      debugLogger('Browser is already running, relying on extension discovery');
+      return;
+    }
+
     const args: string[] = [];
     // The default profile dir is not passed explicitly, the browser resolves it on its own.
     if (this._customUserDataDir)
@@ -184,7 +245,6 @@ export class CDPRelayServer {
       args.push(`--profile-directory=${this._profileDirectory}`);
     if (os.platform() === 'linux' && channel === 'chromium')
       args.push('--no-sandbox');
-    args.push(href);
     const testExecutableArg = process.env.PWTEST_EXTENSION_EXECUTABLE_ARG;
     if (testExecutableArg)
       args.unshift(testExecutableArg);
@@ -260,6 +320,36 @@ export class CDPRelayServer {
     };
     this._extensionConnection.onmessage = (method, params) => this._handler.handleExtensionEvent(method, params);
     this._extensionConnectionPromise.resolve();
+  }
+
+  // Discovery: the extension's background service worker connects to /invites
+  // while scanning the fixed port range. The invite stays available until the
+  // extension claims it by connecting to /extension/<connectionId> (a token
+  // rejection claims it too), so repeated scans and several browser profiles
+  // can safely re-read it. The invite carries the token and the extension
+  // verifies it against its own stored token — exactly like the connect page
+  // did — so a mismatched token still produces the fast, actionable
+  // "rejected the authentication token" error instead of a silent timeout.
+  private _handleInviteConnection(request: http.IncomingMessage, ws: WebSocket): void {
+    if (request.headers.origin !== `chrome-extension://${playwrightExtensionId}`) {
+      ws.close(1000, 'Unexpected origin');
+      return;
+    }
+    if (this._extensionConnection) {
+      ws.close(1000, 'Invite already claimed');
+      return;
+    }
+    const invite: protocol.ExtensionInvite = {
+      type: 'invite',
+      extensionUrl: `${this._wsHost}${this._extensionPath}`,
+      taskId: this._taskId,
+      connectionId: this._connectionId,
+      client: { name: this._clientName },
+      protocolVersion: this._protocolVersion,
+    };
+    if (this._token)
+      invite.token = this._token;
+    ws.send(JSON.stringify(invite));
   }
 
   private async _handlePlaywrightMessage(message: CDPCommand): Promise<void> {

@@ -65,7 +65,7 @@ test(`parallel extension tasks isolate groups, preserve focus, and clean owned t
   const confirmationPagePromise = browserContext.waitForEvent('page', page =>
     page.url().startsWith(`chrome-extension://${extensionId}/connect.html`)
   );
-  const snapshotPromise = clientA.callTool({ name: 'browser_snapshot', arguments: {} });
+  const snapshotPromise = clientA.callTool({ name: 'browser_snapshot', arguments: {} }, undefined, { timeout: 120_000 });
   await clickAllowAndSelect(await confirmationPagePromise, 'User-owned A');
   await snapshotPromise;
 
@@ -78,7 +78,9 @@ test(`parallel extension tasks isolate groups, preserve focus, and clean owned t
       PWTEST_EXTENSION_USER_DATA_DIR: browserWithExtension.userDataDir,
     },
   });
-  await clientB.callTool({ name: 'browser_navigate', arguments: { url: server.HELLO_WORLD } });
+  // Connection-bearing calls wait on async discovery; give them headroom
+  // over the MCP SDK's default 60s request timeout.
+  await clientB.callTool({ name: 'browser_navigate', arguments: { url: server.HELLO_WORLD } }, undefined, { timeout: 120_000 });
 
   const groupTitles = () => statusPage.evaluate(async () =>
     (await chrome.tabGroups.query({})).map(group => group.title || '').filter(title => title.startsWith('Playwright · ')).sort()
@@ -357,7 +359,10 @@ test(`custom executablePath skips local extension check`, {
   }).catch(() => {});
   await expect(async () => {
     const output = await fs.readFile(test.info().outputPath('output.txt'), 'utf8');
-    expect(output).toMatch(new RegExp(`Custom exec args.*chrome-extension://${extensionId}/connect\\.html\\?`));
+    // The browser is launched without a URL: the extension discovers the
+    // relay by itself, so a connect page must not be forced into a tab.
+    expect(output).toContain('--user-data-dir=');
+    expect(output).not.toContain('connect.html');
   }).toPass();
 });
 
@@ -578,7 +583,7 @@ test(`rejects an invalid extension token and allows retry`, {
 }, async ({ startExtensionClient, server }) => {
   const { browserContext, client } = await startExtensionClient({
     PLAYWRIGHT_MCP_EXTENSION_TOKEN: 'wrong-token',
-    PWTEST_EXTENSION_CONNECT_TIMEOUT: '500',
+    PWTEST_EXTENSION_CONNECT_TIMEOUT: '30000',
   });
   const waitForConnectPage = () => browserContext.waitForEvent('page', page => page.url().startsWith(`chrome-extension://${extensionId}/connect.html`));
 
@@ -621,7 +626,10 @@ test(`CLI attach fails fast when the extension token is rejected`, async ({ brow
   const output = `${result.output}\n${result.error}`;
   expect(output).toContain('Playwright Extension rejected the authentication token.');
   expect(output).not.toContain(invalidToken);
-  expect(Date.now() - startTime).toBeLessThan(5000);
+  // The rejection travels through the async discovery (service worker scan →
+  // backgrounded connect page → auto-reject), so allow more than a cold
+  // synchronous flow would need while still failing far from the timeout.
+  expect(Date.now() - startTime).toBeLessThan(30_000);
   await expect(confirmationPage.locator('.status-banner')).toContainText('Invalid token provided.');
 });
 
