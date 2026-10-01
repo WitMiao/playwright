@@ -178,6 +178,12 @@ export function decorateMCPCommand(command: Command) {
                   return;
                 }
 
+                if (config.extension) {
+                  testDebug('disconnect extension browser');
+                  await browser.close().catch(() => { });
+                  return;
+                }
+
                 testDebug('close browser');
                 await browserContext.close().catch(() => { });
                 await browser.close().catch(() => { });

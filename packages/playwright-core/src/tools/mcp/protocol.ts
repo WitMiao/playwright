@@ -43,10 +43,26 @@ export type Tab = {
 };
 export type TabRemoveInfo = { windowId: number; isWindowClosing: boolean };
 
+// Discovery invite sent by the relay's /invites endpoint to the extension's
+// background service worker. Mirrored by RelayInvite in
+// packages/extension/src/relayDiscovery.ts — keep the two in sync.
+export type ExtensionInvite = {
+  type: 'invite';
+  // Relay endpoint the extension opens its protocol connection on.
+  extensionUrl: string;
+  taskId: string;
+  connectionId: string;
+  client: { name?: string; version?: string };
+  protocolVersion: number;
+  // Present only when the client was started with PLAYWRIGHT_MCP_EXTENSION_TOKEN.
+  // The extension accepts silently on a match, otherwise it opens the
+  // connect page (backgrounded) for consent / error reporting.
+  token?: string;
+};
+
 // Protocol v2: command params/results mirror chrome.* positional arguments,
 // so the extension can spread them straight into chrome.<api>.<method>(...).
-export type ExtensionCommandV2 = {
-  // chrome.debugger.attach(target, requiredVersion)
+export type ExtensionCommandV2 = {  // chrome.debugger.attach(target, requiredVersion)
   'chrome.debugger.attach': {
     params: [target: Debuggee, requiredVersion: string];
     result: void;
